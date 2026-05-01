@@ -1,3 +1,4 @@
 .vscode
 output/
+output_inference/
 __pycache__/
