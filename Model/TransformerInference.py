@@ -13,10 +13,22 @@ class TransformerInference(InferenceModel):
         self.bytes_per_val = int(m["bytes_per_val"])
         self.scale = float(m.get("scale", 1.0))
 
+        #parallelism degree (TP and PP)
+        par=config.get("parallelism", {})
+        self.tp_size = int(par.get("tp_size", 1))
+        self.pp_size = int(par.get("pp_size", 1))
+
         #Identical to the formula for the number of parameters in the training model, since the inference model has the same architecture and we are not omitting any weight matrix
         self.num_params = 12 * self.num_layers * self.hidden_size * self.hidden_size * (1 + ((13)/(12*self.num_layers*self.hidden_size)) + ((self.vocab_size + self.sequence_len)/(12*self.num_layers*self.hidden_size)))
 
-        self.layers = [TransformerInferenceLayer(self.hidden_size, self.bytes_per_val, self.scale) for _ in range(self.num_layers)]
+        self.layers = [
+            TransformerInferenceLayer(hidden_size=self.hidden_size, 
+                bytes_per_val=self.bytes_per_val, 
+                scale=self.scale, 
+                tp_size=self.tp_size
+            ) 
+            for _ in range(self.num_layers)
+        ]
 
     def prefill(self, name, npu_id, layer, num_batches, prompt_len, pg_name = None):
         if prompt_len > self.sequence_len:
@@ -54,6 +66,12 @@ class TransformerInference(InferenceModel):
     
     def get_scale(self) -> float: 
         return self.scale
+
+    def get_tp_size(self) -> int:
+        return self.tp_size
+    
+    def get_pp_size(self) -> int:
+        return self.pp_size
     
     def get_layers(self): 
         return self.layers

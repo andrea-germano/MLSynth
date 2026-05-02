@@ -2,3 +2,4 @@
 output/
 output_inference/
 __pycache__/
+test.py
