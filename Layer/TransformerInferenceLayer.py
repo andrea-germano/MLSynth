@@ -9,6 +9,7 @@ from utils import compute, allreduce
 # Q,K,V,O matrices are each of size d*d/tp per TP rank and the MLP up and down projection matrices are 4d^2/tp each
 # K and V are produced by column-parallel projections, so each TP rank stores 1/tp slice of the KV cache
 
+#! It is supposed that a method like flash attention is used, since with a naive attention implementation the memory access for the attention scores would be much higher
 
 #! Forse possiamo omettere la lettura e la scrittura degli input e output activations, perchè spesso sono ottimizzati e non sono presenti
 class TransformerInferenceLayer(InferenceLayer):
@@ -86,7 +87,7 @@ class TransformerInferenceLayer(InferenceLayer):
             + B*1*d*b #input activation read for the single token being processed 
             + B*1*d*b #output activation written
         ))
-        
+
         ffwd_flops = int(self.scale * (16*B*1*d*d) // self.tp_size) # 16*B*1*d^2 for the two matrix multiplications in the MLP
         ffwd_parent = [attn_allreduce] if attn_allreduce else [attn_node]
         ffwd_node = compute(ffwd_flops, ffwd_tensor, parents=ffwd_parent, name=f"{name}_ffwd_compute")

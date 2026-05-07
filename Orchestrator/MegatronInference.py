@@ -22,8 +22,10 @@ class MegatronInference(Orchestrator):
         self.prompt_len = int(infer_cfg.get("prompt_len", 128))
         self.num_generated_tokens = int(infer_cfg.get("num_generated_tokens", 32))
 
-        # In single-request PP inference stage 0 cannot embed token t+1 until stage P-1 has sampled it from token t's logit. This flag adds an explicit dependency from the head
-        #  of stage 0 at decode step t+1 to the tail of stage P-1 at decode step t. Set to False only when modelling a saturated pipeline with multiple requests in flight (continuos batching)
+        # In single-request PP inference stage 0 cannot embed token t+1 until stage P-1 has sampled it from token t's logit.
+        # We model this with a small COMM_SEND/COMM_RECV pair per TP shard from stage P-1 to stage 0 between consecutive
+        # iterations (see `_emit_sampling_broadcast`). 
+        #! Set to False only when modelling a saturated pipeline with multiple requests in flight (continuous batching with micro-batched pipelining)
         self.serialize_decode_iterations = bool(infer_cfg.get("serialize_decode_iterations", True))
 
         par=config.get("parallelism", {})
@@ -69,18 +71,23 @@ class MegatronInference(Orchestrator):
         
         # Keep track of the last emitted node for each gpu, both within a phase and accross phases (prefill -> decode -> decode ...)
         last_node={npu_id: None for npu_id in range(self.num_npus)}
-        last_recv = {npu_id: None for npu_id in range(self.num_npus)} #keep track of the last COMM_RECV for each gpu, since it's usually the bottleneck and we want to hook the next phase's head to it if possible to increase parallelism
 
-        self.emit_prefill(nodes, last_node, last_recv)
+        self.emit_prefill(nodes, last_node)
+
+        self._emit_autoregressive_feedback(nodes, last_node, label="POST_PREFILL")
 
         for token_idx in range(self.num_generated_tokens):
             kv_len = self.prompt_len + token_idx + 1 #the length of the KV cache grows by one at each decode step
-            self.emit_decode(nodes, last_node, last_recv, token_idx=token_idx, kv_len=kv_len)
+            self.emit_decode(nodes, last_node, token_idx=token_idx, kv_len=kv_len)
+
+            # serialization for the next token. Skip after the last token
+            if token_idx < self.num_generated_tokens - 1:
+                self._emit_autoregressive_feedback(nodes, last_node, label=f"POST_DECODE_t{token_idx}")
         
         return nodes
     
 
-    def emit_prefill(self, nodes, last_node, last_recv) -> None:
+    def emit_prefill(self, nodes, last_node) -> None:
         """Emit a single PP traversal for the prefill phase. Each PP stage executes its owned layers over the full prompt_len tokens, with TP all-reduces already accounted for in the layer implementation."""
         B = self.batch_size
 
@@ -99,7 +106,6 @@ class MegatronInference(Orchestrator):
                     )
                     nodes[npu_id].append(recv_node)
                     last_node[npu_id] = recv_node
-                    last_recv[npu_id] = recv_node
 
                 # compute nodes for each layer owned by this PP stage (TP parallelism is aalready accounted for within the layer implementation)
                 for local_layer in range(self.layers_per_stage):
@@ -126,18 +132,11 @@ class MegatronInference(Orchestrator):
                     nodes[npu_id].append(send_node)
                     last_node[npu_id] = send_node
 
-    def emit_decode(self, nodes, last_node, last_recv, token_idx, kv_len) -> None:
+    def emit_decode(self, nodes, last_node, token_idx, kv_len) -> None:
         """Emit a single PP traversal for one decode step. Each step processes exactly one new token; every layer reads a KV cache of length `kv_len`. The auto-regressive cross-iteration edge
         (see `serialize_decode_iterations` in __init__) is installed on the head of stage 0 to model the dependency on stage P-1's sampling."""
 
         B = self.batch_size
-
-        # stage 0 of this iteration cannot start until stage P-1 has finished sampling the previous token.
-        if self.serialize_decode_iterations and self.pp_size > 1:
-            last_stage_anchor_gpu = (self.pp_size - 1) * self.tp_size #the first GPU of the last PP stage
-            prev_iter_tail = last_node[last_stage_anchor_gpu]
-        else:
-            prev_iter_tail = None
         
         for pp_stage in range(self.pp_size):
             for tp_shard in range(self.tp_size):
@@ -154,12 +153,6 @@ class MegatronInference(Orchestrator):
                     )
                     nodes[npu_id].append(recv_node)
                     last_node[npu_id] = recv_node
-                    last_recv[npu_id] = recv_node
-
-                #dependency on the previous decode iteration's tail node for the head of stage 0 to serialize decode iterations if the flag is set
-                extra_dependency = []
-                if pp_stage == 0 and prev_iter_tail is not None and prev_iter_tail is not last_node[npu_id]:
-                    extra_dependency.append(prev_iter_tail)
 
                 #compute nodes for each layer owned by this PP stage
                 for local_layer in range(self.layers_per_stage):
@@ -167,14 +160,9 @@ class MegatronInference(Orchestrator):
                     name = f"COMP_NODE_DECODE_t{token_idx}_L{global_layer}_pp{pp_stage}_tp{tp_shard}"
                     layer_nodes= self.model.decode(name=name, npu_id=npu_id, layer=global_layer, num_batches=B, kv_len=kv_len, pg_name=tg_pg_name)
 
-                    parents_for_head = []
                     if last_node[npu_id]:
-                        parents_for_head.append(last_node[npu_id])
-                    if local_layer == 0 and extra_dependency:
-                        parents_for_head.extend(extra_dependency)
-                    if parents_for_head:
-                        add_dependencies(layer_nodes[0], parents_for_head)
-                    
+                        add_dependencies(layer_nodes[0], [last_node[npu_id]])
+                
                     for node in layer_nodes:
                         nodes[npu_id].append(node)
                     last_node[npu_id] = layer_nodes[-1]
@@ -189,3 +177,34 @@ class MegatronInference(Orchestrator):
                     )
                     nodes[npu_id].append(send_node)
                     last_node[npu_id] = send_node
+    
+    def _emit_autoregressive_feedback(self, nodes, last_node, label) -> None:
+        """Cross-iteration auto-regressive serialization: the sampled token must travel from the tail PP stage back to the head PP stage before the next iteration can start.
+        Realized as a small COMM_SEND/COMM_RECV pair per TP shard."""
+
+        if not (self.serialize_decode_iterations and self.pp_size > 1):
+            return
+
+        EMIT_BYTES = 8 # We can get away with sending just the token ids, which are typically 4 or 8 bytes, instead of the full activation
+        for tp_shard in range(self.tp_size):
+            src_npu = (self.pp_size - 1) * self.tp_size + tp_shard
+            dst_npu = tp_shard
+
+            #send on stage P-1
+            send_node = send(
+                sender=src_npu, receiver=dst_npu, size=EMIT_BYTES, 
+                parents=[last_node[src_npu]] if last_node[src_npu] else None,
+                name=f"COMM_SEND_SAMPLE_{label}_tp{tp_shard}"
+            )
+
+            nodes[src_npu].append(send_node)
+            last_node[src_npu] = send_node 
+
+            #recv on stage 0
+            recv_node = receive(
+                sender=src_npu, receiver=dst_npu, size=EMIT_BYTES, 
+                parents=[last_node[dst_npu]] if last_node[dst_npu] else None,
+                name=f"COMM_RECV_SAMPLE_{label}_tp{tp_shard}"
+            )
+            nodes[dst_npu].append(recv_node)
+            last_node[dst_npu] = recv_node            
