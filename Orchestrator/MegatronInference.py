@@ -133,21 +133,20 @@ class MegatronInference(Orchestrator):
                     last_node[npu_id] = send_node
 
     def emit_decode(self, nodes, last_node, token_idx, kv_len) -> None:
-        """Emit a single PP traversal for one decode step. Each step processes exactly one new token; every layer reads a KV cache of length `kv_len`. The auto-regressive cross-iteration edge
-        (see `serialize_decode_iterations` in __init__) is installed on the head of stage 0 to model the dependency on stage P-1's sampling."""
+        """Emit a single PP traversal for one decode step. Each step processes exactly one new token; every layer reads a KV cache of length `kv_len`. """
 
         B = self.batch_size
         
         for pp_stage in range(self.pp_size):
             for tp_shard in range(self.tp_size):
                 npu_id = pp_stage * self.tp_size + tp_shard
-                tg_pg_name = f"tp_{pp_stage}" if self.tp_size > 1 else None
+                tp_pg_name = f"tp_{pp_stage}" if self.tp_size > 1 else None
 
                 # Receive single-token activation from previous stage
                 if pp_stage > 0:
-                    scr_node = npu_id - self.tp_size
+                    scr_npu = npu_id - self.tp_size
                     recv_node = receive(
-                        sender=scr_node, receiver=npu_id, size=self.pp_decode_comm_size, 
+                        sender=scr_npu, receiver=npu_id, size=self.pp_decode_comm_size, 
                         parents=[last_node[npu_id]] if last_node[npu_id] else None,
                         name=f"COMM_RECV_DECODE_t{token_idx}_pp{pp_stage}_tp{tp_shard}"
                     )
@@ -158,7 +157,7 @@ class MegatronInference(Orchestrator):
                 for local_layer in range(self.layers_per_stage):
                     global_layer = pp_stage*self.layers_per_stage + local_layer
                     name = f"COMP_NODE_DECODE_t{token_idx}_L{global_layer}_pp{pp_stage}_tp{tp_shard}"
-                    layer_nodes= self.model.decode(name=name, npu_id=npu_id, layer=global_layer, num_batches=B, kv_len=kv_len, pg_name=tg_pg_name)
+                    layer_nodes= self.model.decode(name=name, npu_id=npu_id, layer=global_layer, num_batches=B, kv_len=kv_len, pg_name=tp_pg_name)
 
                     if last_node[npu_id]:
                         add_dependencies(layer_nodes[0], [last_node[npu_id]])

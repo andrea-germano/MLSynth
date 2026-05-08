@@ -59,10 +59,10 @@ def build_run_name(cfg: dict) -> str:
     tp = int(par.get("tp_size", 1))
     pp = int(par.get("pp_size", 1))
     return (
-        f"{m['name']}_inference_"
-        f"P{inf['prompt_len']}_G{inf['num_generated_tokens']}_"
-        f"B{m['batch_size']}_d{m['hidden_size']}_L{m['num_layers']}_"
-        f"tp{tp}_pp{pp}_b{m['bytes_per_val']}"
+        f"{m['name']}"
+        # f"_P{inf['prompt_len']}_G{inf['num_generated_tokens']}_"
+        # f"B{m['batch_size']}_d{m['hidden_size']}_L{m['num_layers']}_"
+        # f"tp{tp}_pp{pp}_b{m['bytes_per_val']}"
     )
 
 def main(argv = None) -> int:

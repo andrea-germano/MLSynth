@@ -1,13 +1,18 @@
 model:
-  name: "transformer"
-  num_layers: 12
-  sequence_len: 4096        # max supported sequence length (prompt + generated)
-  vocab_size: 51200
-  hidden_size: 4096
+  name: "transformer_test_tp"
+  num_layers: 2
+  sequence_len: 64
+  vocab_size: 1024
+  hidden_size: 128
   batch_size: 1
   bytes_per_val: 2
   scale: 1.0
 
 inference:
-  prompt_len: 512           # tokens processed in the prefill phase
-  num_generated_tokens: 64  # tokens produced by the decode loop
+  prompt_len: 4
+  num_generated_tokens: 2
+  serialize_decode_iterations: true
+
+parallelism:
+  pp_size: 2
+  tp_size: 2
