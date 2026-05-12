@@ -1,0 +1,28 @@
+model:
+  name: "transformer_test"
+  num_layers: 2
+  sequence_len: 64
+  vocab_size: 1024
+  hidden_size: 128
+  batch_size: 1
+  bytes_per_val: 2
+  scale: 1.0
+
+inference:
+  prompt_len: 4              
+  num_generated_tokens: 2       
+  serialize_decode_iterations: true
+
+parallelism:
+    tp_size: 2
+    pp_size: 2
+
+disaggregation:
+  # NPU 0, 1, 2, 3
+  prefill:
+    tp_size: 2
+    pp_size: 2
+  # NPU 4, 5, 6, 7
+  decode:
+    tp_size: 2
+    pp_size: 2
