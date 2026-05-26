@@ -3,6 +3,7 @@ from chakra.schema.protobuf.et_def_pb2 import GlobalMetadata
 
 from Orchestrator.Orchestrator import Orchestrator
 from Model.TransformerInference import InferenceModel
+from config import InferenceConfig
 from utils import add_dependencies
 
 class SingleDeviceInference(Orchestrator):
@@ -15,17 +16,9 @@ class SingleDeviceInference(Orchestrator):
     and decode step t starts only after decode step t-1 of the last layer is complete.
     """
 
-    def __init__(self, model: InferenceModel, config):
+    def __init__(self, model: InferenceModel, inf_cfg: InferenceConfig):
         self.model = model
-        self.config = config
-        
-        infer_cfg = config.get("inference", {})
-        self.prompt_len = int(infer_cfg.get("prompt_len", 128))
-        self.num_generated_tokens = int(infer_cfg.get("num_generated_tokens", 32))
-
-        self.batch_size = self.model.get_batch_size()
-        self.num_layers = self.model.get_num_layers()
-
+        self.inf = inf_cfg
         self.num_npus = 1 # for now only single device inference
     
     def generate_comm_groups(self):
@@ -36,16 +29,17 @@ class SingleDeviceInference(Orchestrator):
         npu_id=0
         nodes[npu_id].append(GlobalMetadata(version="0.0.4"))
 
-        B = self.batch_size
+        B = self.model.get_batch_size()
+        L = self.model.get_num_layers()
         prev_node = None
 
-        for layer in range(self.num_layers):
+        for layer in range(L):
             layer_nodes =self.model.prefill(
                 name=f"COMP_NODE_PREFILL_L{layer}",
                 npu_id=npu_id,
                 layer=layer,
                 num_batches=B,
-                prompt_len=self.prompt_len,
+                prompt_len=self.inf.prompt_len,
             )
             
             #Hook the first node of this layer onto the tail of the previous (nothing for layer 0)
@@ -56,9 +50,9 @@ class SingleDeviceInference(Orchestrator):
                 nodes[npu_id].append(n)
             prev_node = layer_nodes[-1]
         
-        for t in range(self.num_generated_tokens):
-            kv_len = self.prompt_len + t + 1 # +1 because we include the token being produced in the current step
-            for layer in range(self.num_layers):
+        for t in range(self.inf.num_generated_tokens):
+            kv_len = self.inf.prompt_len + t + 1 # +1 because we include the token being produced in the current step
+            for layer in range(L):
                 layer_nodes = self.model.decode(
                     name=f"COMP_NODE_DECODE_T{t}_L{layer}",
                     npu_id=npu_id,
