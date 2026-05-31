@@ -51,6 +51,18 @@ def compute(flops: int, tensor_size: int, parents: Optional[List[ChakraNode]] = 
                 node.data_deps.append(parent.id)
     return node
 
+#! Potrebbe essere sbagliato e la nuova versione di astra sim potrebbe non essere in grado di leggere questo attributo, da verificare
+def compute_time(run_time_micros: int, parents: Optional[List[ChakraNode]] = None, name: str = "COMP_NODE") -> ChakraNode:
+    """Create a compute node with a specified runtime in microseconds."""
+    node = get_node(name, COMP_NODE)
+    node.attr.append(ChakraAttr(name="is_cpu_op", bool_val=False))
+    node.attr.append(ChakraAttr(name="simulated_run_time", int64_val=run_time_micros))
+    if parents:
+        for p in parents:
+            if p:
+                node.data_deps.append(p.id)
+    return node
+
 def send(sender, receiver, size, name="COMM_SEND_NODE", parents: Optional[List[ChakraNode]] = None):    
     node = get_node(name, COMM_SEND_NODE)
     node.attr.append(ChakraAttr(name="is_cpu_op", bool_val=False))

@@ -1,18 +1,20 @@
 model:
-  name: "transformer_test_tp"
-  num_layers: 2
-  sequence_len: 64
-  vocab_size: 1024
-  hidden_size: 128
-  batch_size: 1
+  name: "transformer_test"
+  num_layers: 8
+  hidden_size: 4096
+  sequence_len: 4096
+  vocab_size: 32000
   bytes_per_val: 2
   scale: 1.0
 
-inference:
-  prompt_len: 4
-  num_generated_tokens: 2
-  serialize_decode_iterations: true
+hardware:
+  peak_flops: 3.0e14         # H100 fp16, ~300 TFLOPS
+  memory_bandwidth: 3.0e12   # H100 HBM3, ~3 TB/s
 
-parallelism:
+prefill_parallelism:
+  tp_size: 4
   pp_size: 2
-  tp_size: 2
+
+decode_parallelism:
+  tp_size: 8
+  pp_size: 1
