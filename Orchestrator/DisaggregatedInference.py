@@ -73,15 +73,22 @@ class DisaggregatedInference(Orchestrator):
     def _get_decode_npu_id(self, pp_stage:int, tp_rank:int) -> int:
         return self.prefill_npus + (pp_stage * self.decode_cfg.tp_size) + tp_rank
 
+    # SINGLE SOURCE OF TRUTH for the pg_name strings. They are used both when building comm_groups.json (generate_comm_groups) and when tagging the COMM_COLL nodes (_emit_prefill / _emit_decode).
+    def _prefill_tp_pg(self, pp_stage: int) -> str:
+        return f"prefill_tp_{pp_stage}"
+
+    def _decode_tp_pg(self, pp_stage: int) -> str:
+        return f"decode_tp_{pp_stage}"
+
     def generate_comm_groups(self) -> dict:
         groups: Dict[str, List[int]] = {}
         if self.prefill_cfg.tp_size > 1:
             for stage in range(self.prefill_cfg.pp_size):
-                group_name=f"pf_tp_{stage}"
+                group_name = self._prefill_tp_pg(stage)
                 groups[group_name] = [self._get_prefill_npu_id(stage, rank) for rank in range(self.prefill_cfg.tp_size)]
         if self.decode_cfg.tp_size > 1:
             for stage in range(self.decode_cfg.pp_size):
-                group_name=f"dc_tp_{stage}"
+                group_name = self._decode_tp_pg(stage)
                 groups[group_name] = [self._get_decode_npu_id(stage, rank) for rank in range(self.decode_cfg.tp_size)]
         return groups
     
@@ -140,7 +147,7 @@ class DisaggregatedInference(Orchestrator):
         for stage in range(self.prefill_cfg.pp_size):
             for rank in range(tp_size):
                 npu = self._get_prefill_npu_id(stage, rank)
-                process_group = f"prefill_tp_{stage}" if tp_size > 1 else None
+                process_group = self._prefill_tp_pg(stage) if tp_size > 1 else None
 
                 #Receive the activations from the previous stage
                 if stage > 0:
@@ -277,7 +284,7 @@ class DisaggregatedInference(Orchestrator):
             for stage in range(self.decode_cfg.pp_size):
                 for rank in range(tp_size):
                     npu = self._get_decode_npu_id(stage, rank)
-                    process_group = f"decode_tp_{stage}" if tp_size > 1 else None
+                    process_group = self._decode_tp_pg(stage) if tp_size > 1 else None
 
                     #Receives the activations from the previous stage (or the KV cache for the first stage)
                     if stage > 0:
