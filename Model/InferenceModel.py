@@ -1,8 +1,9 @@
+from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import List
-from chakra.schema.protobuf.et_def_pb2 import Node as ChakraNode
 
-from Layer.TransformerInferenceLayer import TransformerInferenceLayer
+from Layer.InferenceLayer import LayerEmission
+from config import ModelConfig, ParallelismConfig
 
 class InferenceModel(ABC):
     """Interface for an inference-mode model composed of inference layers.
@@ -10,9 +11,24 @@ class InferenceModel(ABC):
     than fwd/bckwd """
 
     @abstractmethod
-    def prefill(self,name: str,npu_id: int,layer: int,num_batches: int,prompt_len: int,pg_name: str | None = None) -> List[ChakraNode]:
+    def prefill(self, name: str, npu_id: int, layer: int, prompt_lens: List[int], pg_name: str | None = None) -> LayerEmission:
         raise NotImplementedError
 
     @abstractmethod
-    def decode(self,name: str,npu_id: int,layer: int,num_batches: int,kv_len: int,pg_name: str | None = None) -> List[ChakraNode]:
+    def decode(self, name: str, npu_id: int, layer: int, kv_lens: List[int], pg_name: str | None = None) -> LayerEmission:
+        raise NotImplementedError
+    
+    @abstractmethod
+    def with_parallelism(self, parallelism: ParallelismConfig) -> "InferenceModel":
+        """Return a view of this model with a different parallelism config but the SAME (by identity) ModelConfig."""
+        raise NotImplementedError
+    
+    @property
+    @abstractmethod
+    def model_cfg(self) -> ModelConfig:
+        raise NotImplementedError
+    
+    @property
+    @abstractmethod
+    def parallelism(self) -> ParallelismConfig:
         raise NotImplementedError
