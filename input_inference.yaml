@@ -1,18 +1,38 @@
 model:
-  name: "transformer_test_tp"
-  num_layers: 2
-  sequence_len: 64
+  name: "transformer_disagg_demo"
+  num_layers: 4
+  sequence_len: 256
   vocab_size: 1024
   hidden_size: 128
-  batch_size: 1
   bytes_per_val: 2
   scale: 1.0
 
+# Different parallelism for the two pools. KV resharding handles the TP
+# mismatch (one TP size must divide the other).
+prefill_parallelism:
+  tp_size: 2
+  pp_size: 2
+
+decode_parallelism:
+  tp_size: 1
+  pp_size: 2
+
 inference:
-  prompt_len: 4
-  num_generated_tokens: 2
   serialize_decode_iterations: true
 
-parallelism:
-  pp_size: 2
-  tp_size: 2
+  kv_transfer:
+    mode: streaming        # bulk | streaming
+    direction: pull        # push | pull
+    explicit_request: true # only used when direction == pull
+
+  # The static "blob" of requests (no arrival times, no continuous batching).
+  # Heterogeneous prompt / generation lengths are allowed.
+  requests:
+    - { prompt_len: 16, gen_len: 4 }
+    - { prompt_len: 8,  gen_len: 6 }
+    - { prompt_len: 32, gen_len: 2 }
+
+  # Homogeneous shorthand (use instead of `requests`):
+  # num_requests: 4
+  # prompt_len: 16
+  # gen_len: 4
