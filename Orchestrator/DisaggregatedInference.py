@@ -1,9 +1,17 @@
+from __future__ import annotations
 from collections import defaultdict
+from typing import Dict, List, Optional, Tuple
 from chakra.schema.protobuf.et_def_pb2 import GlobalMetadata
 
+from config import RunConfig
 from Orchestrator.Orchestrator import Orchestrator
-from Model.TransformerInference import InferenceModel
+from Model.InferenceModel import InferenceModel
 from utils import add_dependencies, send, receive
+
+# size of bytes of a pull request message
+REQUEST_BYTES = 8
+# size of bytes of the sampled token feedback (used for serialization of decode iterations)
+SAMPLE_BYTES = 8
 
 class DisaggregatedInference(Orchestrator):
     """Separate pool for prefill and decode to model a disaggregated inference system where prefill and decode can be executed on different hardware.
@@ -13,248 +21,331 @@ class DisaggregatedInference(Orchestrator):
     #Prefill pool: NPU ids [0, num_prefill_npus),
     #Decode pool: NPU ids [num_prefill_npus, num_prefill_npus + num_decode_npus)
 
-    def __init__(self, model: InferenceModel, config: dict):
-        self.model=model
-        self.config = config
+    def __init__(self, model: InferenceModel, run: RunConfig):
+        self.run = run
+        self.model = model
 
-        infer_cfg = config.get("inference", {})
-        self.prompt_len = int(infer_cfg.get("prompt_len", 128))
-        self.num_generated_tokens = int(infer_cfg.get("num_generated_tokens", 32))
-        self.serialize_decode_iterations = bool(infer_cfg.get("serialize_decode_iterations", False))
+        self.prefill_cfg = run.prefill
+        self.decode_cfg = run.decode
+        self.kv_cfg = run.inference.kv_transfer
+        self.serialize_decode = run.inference.serialize_decode_iterations
+
+        #different views of the same model with different parallelism configs for prefill and decode pools, same model_cfg shared by identity
+        self.prefill_model = model.with_parallelism(run.prefill)
+        self.decode_model = model.with_parallelism(run.decode)
+
+        #Model metadata
+        model_cfg = run.model
+        self.num_layers = model_cfg.num_layers
+        self.hidden_size = model_cfg.hidden_size
+        self.bytes_per_val = model_cfg.bytes_per_val
+        self.scale = model_cfg.scale
+
+        if self.num_layers % self.prefill_cfg.pp_size != 0:
+            raise ValueError(f"num_layers ({self.num_layers}) must be divisible by prefill pp_size ({self.prefill_cfg.pp_size})")
+        if self.num_layers % self.decode_cfg.pp_size != 0:
+            raise ValueError(f"num_layers ({self.num_layers}) must be divisible by decode pp_size ({self.decode_cfg.pp_size})")
         
-        disagg = config.get("disaggregation")
-        if disagg is None:
-            raise ValueError("Disaggregation config is required for DisaggregatedInference orchestrator")
-        self.tp_p = int(disagg.get("prefill", {}).get("tp_size", 1))
-        self.pp_p = int(disagg.get("prefill", {}).get("pp_size", 1))
-        self.tp_d = int(disagg.get("decode", {}).get("tp_size", 1))
-        self.pp_d = int(disagg.get("decode", {}).get("pp_size", 1))
+        self.layer_per_stage_prefill = self.num_layers // self.prefill_cfg.pp_size
+        self.layer_per_stage_decode = self.num_layers // self.decode_cfg.pp_size
 
-        #! For now we assume tp_p == tp_d for semplicity, this needs to be relaxed to support different TP sizes in the prefill and decode pools (require KV resharding)
-        if self.tp_p != self.tp_d:
-            raise NotImplementedError("Different TP sizes in prefill and decode pools is not implemented yet, since it requires resharding the KV cache")
+        self.prefill_npus = self.prefill_cfg.num_npus
+        self.decode_npus = self.decode_cfg.num_npus
+        self.total_npus = self.prefill_npus + self.decode_npus
 
-        self.num_prefill_npus = self.tp_p * self.pp_p
-        self.num_decode_npus = self.tp_d * self.pp_d
-        self.num_npus = self.num_prefill_npus + self.num_decode_npus
+        #static request blob of token
+        self.requests = run.inference.requests
+        self.prompt_lens = [req.prompt_len for req in self.requests]
+        self.max_decode_steps = max(req.gen_len for req in self.requests)
+        self.total_prompt_tokens = sum(self.prompt_lens)
 
-        self.batch_size = self.model.get_batch_size()
-        self.num_layers = self.model.get_num_layers()
-        self.bytes_per_val = self.model.get_bytes_per_val()
-        self.hidden_size = self.model.get_hidden_size()
-        self.scale = self.model.get_scale()
+        self.kv_bytes_per_layer = int(self.scale * 2 * self.hidden_size * self.bytes_per_val * self.total_prompt_tokens)
 
-        if self.num_layers % self.pp_p != 0 or self.num_layers % self.pp_d != 0:
-            raise ValueError(f"num_layers ({self.num_layers}) must be divisible by both pp_p ({self.pp_p}) and pp_d ({self.pp_d})")    
-        
-        self.layers_per_prefill_stage = self.num_layers // self.pp_p
-        self.layers_per_decode_stage = self.num_layers // self.pp_d
+        # PP aactivations transfer size
+        self.pp_prefill_bytes= int(self.scale * self.total_prompt_tokens * self.hidden_size * self.bytes_per_val)
 
-        #activation size that needs to be exchanged between PP stages in the prefill and decode pools
-        self.pp_prefill_act_size = int(self.scale * self.batch_size * self.prompt_len * self.hidden_size * self.bytes_per_val)
-        self.pp_decode_act_size = int(self.scale * self.batch_size * 1 * self.hidden_size * self.bytes_per_val) #only the single token being generated at each step
+        self._stream_recv: Dict[Tuple[int,int], List] = defaultdict(list) # (layer, dst) -> recvs
+        self._bulk_recv: Dict[int, List] = defaultdict(list) # dst -> recvs
 
-        # KV cache per layer, per TP rank. Each TP rank holds 1/tp_size of the per_layer KV cache since K and V are produced by column-parallel projections.
-        # Each prefill TP shard sends only its own slice to the corresponding decode TP shard.
-        self.kv_transfer_size_layer = int( self.scale * 2 * self.batch_size * self.prompt_len * self.hidden_size * self.bytes_per_val // self.tp_p)
+    def _get_prefill_npu_id(self, pp_stage:int, tp_rank:int) -> int:
+        return (pp_stage * self.prefill_cfg.tp_size) + tp_rank
     
+    def _get_decode_npu_id(self, pp_stage:int, tp_rank:int) -> int:
+        return self.prefill_npus + (pp_stage * self.decode_cfg.tp_size) + tp_rank
+
     def generate_comm_groups(self) -> dict:
-        comm_groups = defaultdict(list)
-
-        # TP groups for prefill pool
-        if self.tp_p > 1:
-            for pp_stage in range(self.pp_p):
-                for tp_shard in range(self.tp_p):
-                    npu_id = pp_stage * self.tp_p + tp_shard
-                    comm_groups[f"prefill_tp_{pp_stage}"].append(npu_id)
-
-        # TP groups for decode pool
-        if self.tp_d > 1:
-            for pp_stage in range(self.pp_d):
-                for tp_shard in range(self.tp_d):
-                    npu_id = self.num_prefill_npus + pp_stage * self.tp_d + tp_shard
-                    comm_groups[f"decode_tp_{pp_stage}"].append(npu_id)
-
-        return dict(comm_groups)
+        groups: Dict[str, List[int]] = {}
+        if self.prefill_cfg.tp_size > 1:
+            for stage in range(self.prefill_cfg.pp_size):
+                group_name=f"pf_tp_{stage}"
+                groups[group_name] = [self._get_prefill_npu_id(stage, rank) for rank in range(self.prefill_cfg.tp_size)]
+        if self.decode_cfg.tp_size > 1:
+            for stage in range(self.decode_cfg.pp_size):
+                group_name=f"dc_tp_{stage}"
+                groups[group_name] = [self._get_decode_npu_id(stage, rank) for rank in range(self.decode_cfg.tp_size)]
+        return groups
     
     def exec(self) -> dict:
-        nodes = defaultdict(list)
-        for npu_id in range(self.num_npus):
-            nodes[npu_id].append(GlobalMetadata(version="0.0.4"))
-        
-        last_node = {npu_id: None for npu_id in range(self.num_npus)}
+        nodes: Dict[int, list] = defaultdict(list) # npu_id -> list of nodes
+        for npu in range(self.total_npus):
+            nodes[npu].append(GlobalMetadata(version="0.0.4"))
+        last_node_per_npu: Dict[int, Optional[object]] = {npu: None for npu in range(self.total_npus)}
 
-        self._emit_prefill(nodes, last_node)
-
-        # Registriamo i nodi di receive del KV cache sulla gpu di decode
-        self._emit_kv_receives(nodes, last_node)
-
-        # Manda l'ultimo token della prefill pool al primo stadio della decode pool per permettere di iniziare il decode non appena il primo token è pronto
-        self._emit_first_token_transfer(nodes, last_node)
-
-        for token_idx in range(self.num_generated_tokens):
-            kv_len = self.prompt_len + token_idx + 1 #the length of the KV cache grows by one at each decode step
-            self._emit_decode(nodes, last_node, token_idx=token_idx, kv_len=kv_len)
-
-            # serialization for the next token. Skip after the last token
-            if token_idx < self.num_generated_tokens - 1:
-                self._emit_autoregressive_feedback(nodes, last_node, label=f"POST_DECODE_t{token_idx}")
+        kv_ready_hooks = self._emit_prefill(nodes, last_node_per_npu)
+        self._emit_kv_transfer(nodes, last_node_per_npu, kv_ready_hooks)
+        self._emit_decode(nodes, last_node_per_npu)
 
         return nodes
-
-    def _emit_prefill(self, nodes, last_node) -> None:
-        """Emit the prefill phase on the prefill pool. After the prefill phase, the KV cache is transferred from the last PP stage of the prefill pool to all PP stages of the decode pool (one transfer per layer, sharded accross TP ranks)"""
-        B = self.batch_size
-
-        for pp_stage in range(self.pp_p):
-            pg_name = f"prefill_tp_{pp_stage}" if self.tp_p > 1 else None
-            for tp_shard in range(self.tp_p):
-                npu_id = pp_stage * self.tp_p + tp_shard                
-
-                if pp_stage > 0:
-                    scr_npu = npu_id - self.tp_p
-                    recv_node = receive(
-                        sender=scr_npu, receiver=npu_id, size=self.pp_prefill_act_size, 
-                        parents=[last_node[npu_id]] if last_node[npu_id] else None,
-                        name=f"COMM_RECV_PREFILL_pp{pp_stage}_tp{tp_shard}"
-                    )
-                    nodes[npu_id].append(recv_node)
-                    last_node[npu_id] = recv_node
-                
-                for local_layer in range(self.layers_per_prefill_stage):
-                    global_layer = pp_stage*self.layers_per_prefill_stage + local_layer
-                    name = f"COMP_NODE_PREFILL_L{global_layer}_pp{pp_stage}_tp{tp_shard}"
-                    layer_nodes= self.model.prefill(name=name, npu_id=npu_id, layer=global_layer, num_batches=B, prompt_len=self.prompt_len, pg_name=pg_name)
-                    if last_node[npu_id]:
-                        add_dependencies(layer_nodes[0], [last_node[npu_id]])
-                    for n in layer_nodes:
-                        nodes[npu_id].append(n)
-                    
-                    # computation of this layer is finished, KV cache ready to be sent to decode pool
-                    compute_end_node = layer_nodes[-1]
-
-                    dst_pp_decode = global_layer // self.layers_per_decode_stage
-                    dst_npu = self.num_prefill_npus + dst_pp_decode * self.tp_d + tp_shard
-                    send_kv_node = send(
-                        sender=npu_id, receiver=dst_npu, size=self.kv_transfer_size_layer, 
-                        parents=[compute_end_node],
-                        name=f"COMM_SEND_KV_L{global_layer}_tp{tp_shard}"
-                    )
-                    nodes[npu_id].append(send_kv_node)
-                    # Here is not send_kv_node because we want the next layer to be able to start computing as soon as the current layer has finished, without waiting for the KV transfer to complete
-                    last_node[npu_id] = compute_end_node
-
-                if pp_stage < self.pp_p - 1:
-                    dst = npu_id + self.tp_p
-                    send_node = send(
-                        sender=npu_id, receiver=dst, size=self.pp_prefill_act_size, 
-                        parents=[last_node[npu_id]] if last_node[npu_id] else None,
-                        name=f"COMM_SEND_PREFILL_pp{pp_stage}_tp{tp_shard}"
-                    )
-                    nodes[npu_id].append(send_node)
-                    last_node[npu_id] = send_node
     
-    def _emit_kv_receives(self, nodes, last_node) -> None:
+    def _kv_edges(self, layer: int) -> List[Tuple[int,int,int]]:
+        """Return the list of edges needed to transfer the KV cache of a given layer from the prefill pool to the decode pool. Each edge is a tuple (src_npu, dst_npu, bytes)."""
+        tp_prefill, tp_decode = self.prefill_cfg.tp_size, self.decode_cfg.tp_size
+        prefill_stage = layer // self.layer_per_stage_prefill
+        decode_stage = layer // self.layer_per_stage_decode
+        prefill_npus = [self._get_prefill_npu_id(prefill_stage, rank) for rank in range(tp_prefill)]
+        decode_npus = [self._get_decode_npu_id(decode_stage, rank) for rank in range(tp_decode)]
+        full_size = self.kv_bytes_per_layer
+        edges: List[Tuple[int,int,int]] = []
+
+        if tp_prefill == tp_decode:
+            #Mapping 1:1
+            bytes_per_edge = full_size // tp_prefill
+            edges = [(prefill_npus[rank], decode_npus[rank], bytes_per_edge) for rank in range(tp_prefill)]
+        elif tp_decode % tp_prefill == 0:
+            # decode pool has more TP shards, each prefill shard sends to multiple decode shards (1:k)
+            k = tp_decode // tp_prefill
+            bytes_per_edge = full_size // tp_decode
+            for rank in range(tp_prefill):
+                for j in range(k):
+                    edges.append((prefill_npus[rank], decode_npus[rank*k + j], bytes_per_edge))
+        elif tp_prefill % tp_decode == 0:
+            # prefill pool has more TP shards, each decode shard receives from multiple prefill shards and merges them (k:1)
+            k = tp_prefill // tp_decode
+            bytes_per_edge = full_size // tp_prefill
+            for rank in range(tp_prefill):
+                edges.append((prefill_npus[rank], decode_npus[rank // k], bytes_per_edge))
+        else:
+            # This should be prevented by the config validation, but we check again for safety
+            raise ValueError("TP sizes must divide one another (checked in Config)")        
+        return edges
+    
+    # ------------------------------------------------------------------ #
+    # Firts phase: prefill
+    # ------------------------------------------------------------------ #
+    def _emit_prefill(self, nodes: Dict, last_node_per_npu: Dict) -> Dict[Tuple[int,int], object]:
+        """Emit the prefill pass, return the dict describing the kv_ready[(layer, src_npu)] nodes after which the KV cache of each layer is ready to be sent to the decode pool."""
+        kv_ready_hooks: Dict[Tuple[int,int], object] = {}
+        tp_size = self.prefill_cfg.tp_size
+
+        for stage in range(self.prefill_cfg.pp_size):
+            for rank in range(tp_size):
+                npu = self._get_prefill_npu_id(stage, rank)
+                process_group = f"prefill_tp_{stage}" if tp_size > 1 else None
+
+                #Receive the activations from the previous stage
+                if stage > 0:
+                    prev_stage_npu = npu - tp_size
+                    recv_node = receive(
+                        sender=prev_stage_npu, receiver=npu, size=self.pp_prefill_bytes,
+                        parents=[last_node_per_npu[npu]] if last_node_per_npu[npu] else None,
+                        name=f"COMM_RECV_PREFILL_pp{stage}_tp{rank}"
+                    )
+                    nodes[npu].append(recv_node)
+                    last_node_per_npu[npu] = recv_node
+
+                # Emit the prefill computation for the layers owned by this stage
+                for local_layer_idx in range(self.layer_per_stage_prefill):
+                    global_layer_idx = (stage*self.layer_per_stage_prefill) + local_layer_idx
+                    emit_result = self.prefill_model.prefill(
+                        name=f"COMP_PREFILL_L{global_layer_idx}_pp{stage}_tp{rank}", 
+                        layer=global_layer_idx, prompt_lens=self.prompt_lens, pg_name=process_group
+                    )
+                    if last_node_per_npu[npu]:
+                        add_dependencies(emit_result.nodes[0], [last_node_per_npu[npu]])
+                    nodes[npu].extend(emit_result.nodes)
+                    last_node_per_npu[npu] = emit_result.tail
+                    kv_ready_hooks[(global_layer_idx, npu)] = emit_result.kv_ready
+
+                # Send the activations to the next stage
+                if stage < self.prefill_cfg.pp_size - 1:
+                    next_stage_npu = npu + tp_size
+                    send_node = send(
+                        sender=npu, receiver=next_stage_npu, size=self.pp_prefill_bytes,
+                        parents=[last_node_per_npu[npu]] if last_node_per_npu[npu] else None,
+                        name=f"COMM_SEND_PREFILL_pp{stage}_tp{rank}"
+                    )
+                    nodes[npu].append(send_node)
+                    last_node_per_npu[npu] = send_node 
+        return kv_ready_hooks
+
+    # ------------------------------------------------------------------ #
+    # Second phase: KV transfer from prefill to decode
+    # ------------------------------------------------------------------ #
+    def _emit_kv_transfer(self, nodes: Dict, last_node_per_npu: Dict, kv_ready_hooks: Dict) -> None:
+        is_pull_explicit = (self.kv_cfg.direction == "pull" and self.kv_cfg.explicit_request)
+        if self.kv_cfg.mode == "streaming":
+            self._emit_streaming_transfer(nodes, kv_ready_hooks, is_pull_explicit)
+        else:
+            self._emit_bulk_transfer(nodes, last_node_per_npu, is_pull_explicit)
+
+    def _emit_streaming_transfer(self, nodes: Dict, kv_ready_hooks: Dict, is_pull_explicit: bool) -> None:
+        """Emit the streaming transfer of the KV cache for each layer as soon as it is ready in the prefill pool, overlapping communication with the rest of prefill (Splitwise approach)"""
         for layer in range(self.num_layers):
-            src_pp_prefill = layer // self.layers_per_prefill_stage
-            #destination is the decode pp stage that will own this layer
-            dst_pp_decode = layer // self.layers_per_decode_stage
-
-            for tp_shard in range(self.tp_p):
-                src_npu = src_pp_prefill * self.tp_p + tp_shard
-                dst_npu = self.num_prefill_npus + dst_pp_decode * self.tp_d + tp_shard
-
-                recv_node = receive(
-                    sender=src_npu, receiver=dst_npu, size=self.kv_transfer_size_layer, 
-                    parents=[last_node[dst_npu]] if last_node[dst_npu] else None,
-                    name=f"COMM_RECV_KV_L{layer}_tp{tp_shard}"
-                )
-                nodes[dst_npu].append(recv_node)
-                # Decode must wait for the KV cache to be received before starting to compute the layer
-                last_node[dst_npu] = recv_node
+            for (src_npu, dst_npu, size) in self._kv_edges(layer):
+                tag = f"KV_L{layer}_{src_npu}to{dst_npu}"
+                ready_hook = kv_ready_hooks[(layer, src_npu)]
+                recv_node = self._create_kv_transfer_pair(nodes, src_npu, dst_npu, size, ready_hook, tag, is_pull_explicit)
+                self._stream_recv[(layer, dst_npu)].append(recv_node)
     
-    def _emit_first_token_transfer(self, nodes, last_node) -> None:
-        """Transfer the first token to be generated from the last stage of the prefill pool to the first stage of the decode pool"""
-        for tp_shard in range(self.tp_p):
-            # last npu in the prefill pool for this TP shard
-            src_npu = (self.pp_p - 1) * self.tp_p + tp_shard
-            dst_npu = self.num_prefill_npus + 0 * self.tp_d + tp_shard
-            send_node = send(
-                sender=src_npu, receiver=dst_npu, size=self.pp_decode_act_size,
-                parents=[last_node[src_npu]] if last_node[src_npu] else None,
-                name=f"COMM_SEND_FIRST_TOKEN_tp{tp_shard}"
-            )
-            nodes[src_npu].append(send_node)
-            last_node[src_npu] = send_node
+    def _emit_bulk_transfer(self, nodes: Dict, last_node_per_npu: Dict, is_pull_explicit: bool) -> None:
+        """One SEND/RECV per (src,dst) pair carrying the whole KV (all owned layers), hung off the prefill tail of the source (DistServe approach)"""
+        aggregated_bytes: Dict[Tuple[int,int], int] = defaultdict(int) # (src,dst) -> total bytes
+        for layer in range(self.num_layers):
+            for (src_npu, dst_npu, size) in self._kv_edges(layer):
+                aggregated_bytes[(src_npu, dst_npu)] += size
+        for (src_npu, dst_npu), size in aggregated_bytes.items():
+            tag = f"KV_BULK_{src_npu}to{dst_npu}"
+            ready_hook = last_node_per_npu[src_npu]
+            recv_node = self._create_kv_transfer_pair(nodes, src_npu, dst_npu, size, ready_hook, tag, is_pull_explicit)
+            self._bulk_recv[dst_npu].append(recv_node)
 
-            recv_node = receive(
-                sender=src_npu, receiver=dst_npu, size=self.pp_decode_act_size,
-                parents=[last_node[dst_npu]] if last_node[dst_npu] else None,
-                name=f"COMM_RECV_FIRST_TOKEN_tp{tp_shard}"
+    def _create_kv_transfer_pair(self, nodes: Dict, src_npu: int, dst_npu: int, size: int, ready_hook: object, tag: str, is_pull_explicit: bool) -> object:
+        """Emit the send and receive nodes for a single KV transfer, with dependencies to ensure the send happens after `ready`. If `pull_explicit` is True, also emit a request SEND/RECV pair before the transfer."""
+        if is_pull_explicit:
+            #send request
+            req_send = send(
+                sender=dst_npu, receiver=src_npu, size=REQUEST_BYTES, 
+                parents=None,name=f"COMM_SEND_KVREQ_{tag}"
             )
-            nodes[dst_npu].append(recv_node)
-            last_node[dst_npu] = recv_node
+            nodes[dst_npu].append(req_send)
+            req_recv = receive(
+                sender=dst_npu, receiver=src_npu, size=REQUEST_BYTES, 
+                parents=None, name=f"COMM_RECV_KVREQ_{tag}"
+            )
+            nodes[src_npu].append(req_recv)
 
-    def _emit_decode(self, nodes, last_node, token_idx, kv_len) -> None:
+            #send KV cache after receiving the request and after the data is ready
+            kv_send = send(
+                sender=src_npu, receiver=dst_npu, size=size, 
+                parents=[ready_hook, req_recv], name=f"COMM_SEND_KV_{tag}"
+            )
+            nodes[src_npu].append(kv_send)
+            kv_recv = receive(
+                sender=src_npu, receiver=dst_npu, size=size, 
+                parents=[req_send], name=f"COMM_RECV_KV_{tag}"
+            )
+            nodes[dst_npu].append(kv_recv)
+        else:
+            #Pull or implicit push: prefill just sends as soon as ready, decode just receives without waiting for an explicit request
+            kv_send = send(
+                sender=src_npu, receiver=dst_npu, size=size, 
+                parents=[ready_hook], name=f"COMM_SEND_KV_{tag}"
+            )
+            nodes[src_npu].append(kv_send)
+            kv_recv = receive(
+                sender=src_npu, receiver=dst_npu, size=size, 
+                parents=None, name=f"COMM_RECV_KV_{tag}"
+            )
+            nodes[dst_npu].append(kv_recv)
+
+        return kv_recv
+
+    def _get_kv_arrival_dependencies(self, layer: int, npu: int, local_idx: int) -> list:
+        """KV nodes that the first decode step of `layer` on `npu` must wait for. 
+        Streaming gates per layer; bulk gates the whole NPU on its first owned layer."""
+        if self.kv_cfg.mode == "streaming":
+            return list(self._stream_recv.get((layer, npu), []))
+        if local_idx == 0:
+            return list(self._bulk_recv.get(npu, []))
+        return []
+    
+    # ------------------------------------------------------------------ #
+    # Third phase: decode
+    # ------------------------------------------------------------------ #
+    def _emit_decode(self, nodes: Dict, last_node_per_npu: Dict) -> None:
         """Emit a single PP traversal for one decode step. Each step processes exactly one new token; every layer reads a KV cache of length `kv_len`. """
-        B = self.batch_size
+        tp_size = self.decode_cfg.tp_size
+        for npu in range(self.prefill_npus, self.total_npus):
+            last_node_per_npu[npu] = None # reset last_node for decode pool, as decode can start before prefill has finished thanks to streaming KV transfer
+        
+        for step in range(self.max_decode_steps):
+            active_requests = [i for i, req in enumerate(self.requests) if req.gen_len > step]
+            current_kv_lens = [self.requests[i].prompt_len + step + 1 for i in active_requests] # each active request has a KV cache length equal to its prompt length + number of decode steps already processed + 1 for the new token
+            active_batch_size = len(active_requests)
+            pp_decode_bytes = int(self.scale * active_batch_size * self.hidden_size * self.bytes_per_val)
 
-        for pp_stage in range(self.pp_d):
-            pg_name = f"decode_tp_{pp_stage}" if self.tp_d > 1 else None
-            for tp_shard in range(self.tp_d):
-                npu_id = self.num_prefill_npus + pp_stage * self.tp_d + tp_shard
+            for stage in range(self.decode_cfg.pp_size):
+                for rank in range(tp_size):
+                    npu = self._get_decode_npu_id(stage, rank)
+                    process_group = f"decode_tp_{stage}" if tp_size > 1 else None
 
-                if pp_stage > 0:
-                    scr_npu = npu_id - self.tp_d
-                    recv_node = receive(
-                        sender=scr_npu, receiver=npu_id, size=self.pp_decode_act_size, 
-                        parents=[last_node[npu_id]] if last_node[npu_id] else None,
-                        name=f"COMM_RECV_DECODE_t{token_idx}_pp{pp_stage}_tp{tp_shard}"
-                    )
-                    nodes[npu_id].append(recv_node)
-                    last_node[npu_id] = recv_node
-                
-                for local_layer in range(self.layers_per_decode_stage):
-                    global_layer = pp_stage*self.layers_per_decode_stage + local_layer
-                    name = f"COMP_NODE_DECODE_t{token_idx}_L{global_layer}_pp{pp_stage}_tp{tp_shard}"
-                    layer_nodes= self.model.decode(name=name, npu_id=npu_id, layer=global_layer, num_batches=B, kv_len=kv_len, pg_name=pg_name)
-                    if last_node[npu_id]:
-                        add_dependencies(layer_nodes[0], [last_node[npu_id]])
-                    for n in layer_nodes:
-                        nodes[npu_id].append(n)
-                    last_node[npu_id] = layer_nodes[-1]
-                
-                if pp_stage < self.pp_d - 1:
-                    dst = npu_id + self.tp_d
-                    send_node = send(
-                        sender=npu_id, receiver=dst, size=self.pp_decode_act_size, 
-                        parents=[last_node[npu_id]] if last_node[npu_id] else None,
-                        name=f"COMM_SEND_DECODE_t{token_idx}_pp{pp_stage}_tp{tp_shard}"
-                    )
-                    nodes[npu_id].append(send_node)
-                    last_node[npu_id] = send_node
+                    #Receives the activations from the previous stage (or the KV cache for the first stage)
+                    if stage > 0:
+                        recv_node = receive(
+                            sender=npu - tp_size, receiver=npu, size=pp_decode_bytes, 
+                            parents=[last_node_per_npu[npu]] if last_node_per_npu[npu] else None,
+                            name=f"COMM_RECV_DECODE_step{step}_pp{stage}_tp{rank}"
+                        )
+                        nodes[npu].append(recv_node)
+                        last_node_per_npu[npu] = recv_node
+                    
+                    # Emit the decode computation for the layers owned by this stage
+                    for local_layer_idx in range(self.layer_per_stage_decode):
+                        global_layer_idx = stage*self.layer_per_stage_decode + local_layer_idx
+                        emit_result = self.decode_model.decode(
+                            name=f"COMP_DECODE_step{step}_L{global_layer_idx}_pp{stage}_tp{rank}", 
+                            layer=global_layer_idx, kv_lens=current_kv_lens, pg_name=process_group
+                        )
+
+                        dependencies=[]
+                        if last_node_per_npu[npu]:
+                            dependencies.append(last_node_per_npu[npu])
+                        if step == 0:
+                            # Make sure the first decode step waits for the KV cache to be ready
+                            dependencies += self._get_kv_arrival_dependencies(global_layer_idx, npu, local_layer_idx)
+                        if dependencies:
+                            add_dependencies(emit_result.nodes[0], dependencies)
+                        
+                        nodes[npu].extend(emit_result.nodes)
+                        last_node_per_npu[npu] = emit_result.tail
+                    
+                    if stage < self.decode_cfg.pp_size - 1:
+                        next_stage_npu = npu + tp_size
+                        send_node = send(
+                            sender=npu, receiver=next_stage_npu, size=pp_decode_bytes, 
+                            parents=[last_node_per_npu[npu]] if last_node_per_npu[npu] else None,
+                            name=f"COMM_SEND_DECODE_step{step}_pp{stage}_tp{rank}"
+                        )
+                        nodes[npu].append(send_node)
+                        last_node_per_npu[npu] = send_node
+            
+            # Autoregressive serizialization
+            if step < self.max_decode_steps - 1:
+                self._emit_autoregressive_feedback(nodes, last_node_per_npu, label=f"DECODE_step{step}")
     
-    def _emit_autoregressive_feedback(self, nodes, last_node, label) -> None:
-        if not (self.serialize_decode_iterations and self.pp_d > 1):
+    def _emit_autoregressive_feedback(self, nodes: Dict, last_node_per_npu: Dict, label: str) -> None:
+        """The token sampled at the tail PP stage must reach the head stage before the next decode step starts"""
+        if not (self.serialize_decode and self.decode_cfg.pp_size > 1):
+            # With pp_d == 1 the per-NPU chain already serialises steps, so this is only needed for pp_d > 1.
             return
         
-        EMIT_BYTES = 8
-        for tp_shard in range(self.tp_d):
-            src_npu = self.num_prefill_npus + (self.pp_d - 1) * self.tp_d + tp_shard 
-            dst_npu = self.num_prefill_npus + tp_shard 
+        tp_size = self.decode_cfg.tp_size
+        for rank in range(tp_size):
+            src_npu = self._get_decode_npu_id(self.decode_cfg.pp_size - 1, rank)
+            dst_npu = self._get_decode_npu_id(0, rank) 
 
             send_node = send(
-                sender=src_npu, receiver=dst_npu, size=EMIT_BYTES, 
-                parents=[last_node[src_npu]] if last_node[src_npu] else None,
-                name=f"COMM_SEND_{label}_tp{tp_shard}"
+                sender=src_npu, receiver=dst_npu, size=SAMPLE_BYTES, 
+                parents=[last_node_per_npu[src_npu]] if last_node_per_npu[src_npu] else None,
+                name=f"COMM_SEND_SAMPLE_{label}_tp{rank}"
             )
             nodes[src_npu].append(send_node)
-            last_node[src_npu] = send_node
+            last_node_per_npu[src_npu] = send_node
 
             recv_node = receive(
-                sender=src_npu, receiver=dst_npu, size=EMIT_BYTES, 
-                parents=[last_node[dst_npu]] if last_node[dst_npu] else None,
-                name=f"COMM_RECV_{label}_tp{tp_shard}"
+                sender=src_npu, receiver=dst_npu, size=SAMPLE_BYTES, 
+                parents=[last_node_per_npu[dst_npu]] if last_node_per_npu[dst_npu] else None,
+                name=f"COMM_RECV_SAMPLE_{label}_tp{rank}"
             )
             nodes[dst_npu].append(recv_node)
-            last_node[dst_npu] = recv_node
+            last_node_per_npu[dst_npu] = recv_node
