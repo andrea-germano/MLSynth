@@ -1,7 +1,6 @@
 model:
   name: "transformer_disagg_demo"
   num_layers: 4
-  sequence_len: 256
   vocab_size: 1024
   hidden_size: 128
   bytes_per_val: 2

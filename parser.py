@@ -12,7 +12,6 @@ class ModelConfig:
     name: str
     num_layers: int
     hidden_size: int
-    sequence_len: int
     vocab_size: int
     bytes_per_val: int = 2
     scale: float = 1.0
@@ -70,18 +69,17 @@ class RunConfig:
         return RunConfig(model=model, prefill=prefill, decode=decode, inference=inference)
        
 def _build_model(data: dict) -> ModelConfig:
-    _require(data, ("name", "num_layers", "hidden_size", "sequence_len", "vocab_size", "bytes_per_val"), ctx="model")
+    _require(data, ("name", "num_layers", "hidden_size", "vocab_size", "bytes_per_val"), ctx="model")
 
     cfg= ModelConfig(
         name=str(data["name"]),
         num_layers=int(data["num_layers"]),
         hidden_size=int(data["hidden_size"]),
-        sequence_len=int(data["sequence_len"]),
         vocab_size=int(data["vocab_size"]),
         bytes_per_val=int(data["bytes_per_val"]),
         scale=float(data.get("scale", 1.0)),
     )
-    if min(cfg.num_layers, cfg.hidden_size, cfg.sequence_len, cfg.vocab_size, cfg.bytes_per_val) <= 0:
+    if min(cfg.num_layers, cfg.hidden_size, cfg.vocab_size, cfg.bytes_per_val) <= 0:
         raise ValueError("All model parameters must be positive")
     if cfg.bytes_per_val not in (1, 2, 4, 8):
         raise ValueError(f"bytes_per_val must be one of 1/2/4/8, got {cfg.bytes_per_val}")
@@ -138,8 +136,6 @@ def _build_requests(data: dict, model: ModelConfig) -> List[Request]:
     for i, r in enumerate(reqs):
         if r.prompt_len < 1 or r.gen_len < 1:
             raise ValueError(f"request[{i}]: prompt_len and gen_len must be >= 1.")
-        if r.prompt_len + r.gen_len > model.sequence_len:
-            raise ValueError(f"request[{i}]: prompt_len+gen_len ({r.prompt_len + r.gen_len}) exceeds model sequence_len ({model.sequence_len}).")
     return reqs
 
 def _build_kv_transfer(data: dict) -> KVTransferConfig:
