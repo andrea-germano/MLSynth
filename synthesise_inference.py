@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from chakra.src.third_party.utils.protolib import encodeMessage as encode_message
 
-from config import RunConfig
+from mlsynth.parser import RunConfig
 from Model.TransformerInference import TransformerInference
 from Orchestrator.DisaggregatedInference import DisaggregatedInference
 

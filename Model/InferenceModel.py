@@ -3,7 +3,7 @@ from abc import ABC, abstractmethod
 from typing import List
 
 from Layer.InferenceLayer import LayerEmission
-from config import ModelConfig, ParallelismConfig
+from mlsynth.parser import ModelConfig, ParallelismConfig
 
 class InferenceModel(ABC):
     """Interface for an inference-mode model composed of inference layers.
