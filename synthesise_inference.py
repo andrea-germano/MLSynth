@@ -23,11 +23,14 @@ def main(argv = None) -> int:
     parser = argparse.ArgumentParser(description="Synthesize disaggregated inference workload")
     parser.add_argument("-c", "--config", default="input_inference.yaml",
                         help="Path to inference YAML config file")
+    parser.add_argument("-o", "--out-dir", default="output_inference",
+                        help="Base path to output directory (default: output_inference)")
     args = parser.parse_args(argv)
 
     run = RunConfig.from_yaml(args.config)
 
-    out_dir = Path("output_inference") / run.model.name
+    out_dir = Path(args.out_dir) / run.model.name
+    
     et_dir = out_dir / "et"
     et_dir.mkdir(parents=True, exist_ok=True)
 

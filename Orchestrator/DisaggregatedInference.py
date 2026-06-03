@@ -10,7 +10,8 @@ from utils import add_dependencies, send, receive
 
 # size of bytes of a pull request message
 REQUEST_BYTES = 8
-# size of bytes of the sampled token feedback (used for serialization of decode iterations)
+# size of bytes of the sampled token feedback (used for serialization of decode iterations and for the first token handoff from prefill to decode)
+#! Maybe this should be calculated as the size of lm_head * bytes_per_val * scale, to more accurately reflect the size of the autoregressive feedback, but for now we keep it fixed and small as it is only used for synchronization and does not carry actual data in this model of the system.
 SAMPLE_BYTES = 8
 
 class DisaggregatedInference(Orchestrator):
@@ -40,6 +41,7 @@ class DisaggregatedInference(Orchestrator):
         self.hidden_size = model_cfg.hidden_size
         self.bytes_per_val = model_cfg.bytes_per_val
         self.scale = model_cfg.scale
+        self.vocab_size = model_cfg.vocab_size
 
         if self.num_layers % self.prefill_cfg.pp_size != 0:
             raise ValueError(f"num_layers ({self.num_layers}) must be divisible by prefill pp_size ({self.prefill_cfg.pp_size})")
@@ -100,6 +102,7 @@ class DisaggregatedInference(Orchestrator):
 
         kv_ready_hooks = self._emit_prefill(nodes, last_node_per_npu)
         self._emit_kv_transfer(nodes, last_node_per_npu, kv_ready_hooks)
+        self._first_token_recv = self._emit_first_token(nodes, last_node_per_npu)
         self._emit_decode(nodes, last_node_per_npu)
 
         return nodes
@@ -267,13 +270,38 @@ class DisaggregatedInference(Orchestrator):
         return []
     
     # ------------------------------------------------------------------ #
-    # Third phase: decode
+    # Second phase: emit the first token computed by the prefill
+    # ------------------------------------------------------------------ #
+    def _emit_first_token(self, nodes: Dict, last_node_per_npu: Dict) -> Dict:
+        """Causal handoff of the FIRST token: prefill last stage -> decode stage 0.
+        Transport only (token id, SAMPLE_BYTES). Mirrors the autoregressive feedback"""
+        last_stage = self.prefill_cfg.pp_size - 1
+        tp_p = self.prefill_cfg.tp_size
+        token_recv_per_npu = {}
+        for dst_rank in range(self.decode_cfg.tp_size):
+            src_npu = self._get_prefill_npu_id(last_stage, dst_rank % tp_p)
+            dst_npu = self._get_decode_npu_id(0, dst_rank)
+            send_node = send(sender=src_npu, receiver=dst_npu, size=SAMPLE_BYTES,
+                            parents=[last_node_per_npu[src_npu]],
+                            name=f"COMM_SEND_FIRSTTOK_tp{dst_rank}")
+            nodes[src_npu].append(send_node)
+            last_node_per_npu[src_npu] = send_node
+            recv_node = receive(sender=src_npu, receiver=dst_npu, size=SAMPLE_BYTES,
+                                parents=None, name=f"COMM_RECV_FIRSTTOK_tp{dst_rank}")
+            nodes[dst_npu].append(recv_node)
+            token_recv_per_npu[dst_npu] = recv_node
+        return token_recv_per_npu
+    
+    # ------------------------------------------------------------------ #
+    # Fourth phase: decode
     # ------------------------------------------------------------------ #
     def _emit_decode(self, nodes: Dict, last_node_per_npu: Dict) -> None:
         """Emit a single PP traversal for one decode step. Each step processes exactly one new token; every layer reads a KV cache of length `kv_len`. """
         tp_size = self.decode_cfg.tp_size
         for npu in range(self.prefill_npus, self.total_npus):
-            last_node_per_npu[npu] = None # reset last_node for decode pool, as decode can start before prefill has finished thanks to streaming KV transfer
+            # Streaming overlaps KV *transfer* with prefill, but the first decode step is still gated by the first-token handoff (see _emit_first_token).
+            # Done just for safety, not useful since prefill does not touch decode NPUs traces
+            last_node_per_npu[npu] = None 
         
         for step in range(self.max_decode_steps):
             active_requests = [i for i, req in enumerate(self.requests) if req.gen_len > step]
@@ -310,6 +338,11 @@ class DisaggregatedInference(Orchestrator):
                         if step == 0:
                             # Make sure the first decode step waits for the KV cache to be ready
                             dependencies += self._get_kv_arrival_dependencies(global_layer_idx, npu, local_layer_idx)
+                            if local_layer_idx == 0:
+                                # The first layer of the first decode stage must also wait for the first token from prefill
+                                token_recv = self._first_token_recv.get(npu)
+                                if token_recv:
+                                    dependencies.append(token_recv)
                         if dependencies:
                             add_dependencies(emit_result.nodes[0], dependencies)
                         
