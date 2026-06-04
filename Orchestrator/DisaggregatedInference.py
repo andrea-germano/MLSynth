@@ -3,7 +3,7 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 from chakra.schema.protobuf.et_def_pb2 import GlobalMetadata
 
-from mlsynth.parser import RunConfig
+from parser import RunConfig
 from Orchestrator.Orchestrator import Orchestrator
 from Model.InferenceModel import InferenceModel
 from utils import add_dependencies, send, receive

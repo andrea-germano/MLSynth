@@ -2,7 +2,7 @@ from typing import List
 
 from Model.InferenceModel import InferenceModel
 from Layer.TransformerInferenceLayer import TransformerInferenceLayer
-from mlsynth.parser import ModelConfig, ParallelismConfig
+from parser import ModelConfig, ParallelismConfig
 from Layer.InferenceLayer import LayerEmission
 
 class TransformerInference(InferenceModel):
