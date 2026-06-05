@@ -285,7 +285,7 @@ class DisaggregatedInference(Orchestrator):
                             parents=[last_node_per_npu[src_npu]],
                             name=f"COMM_SEND_FIRSTTOK_tp{dst_rank}")
             nodes[src_npu].append(send_node)
-            last_node_per_npu[src_npu] = send_node
+            #last_node_per_npu[src_npu] = send_node
             recv_node = receive(sender=src_npu, receiver=dst_npu, size=SAMPLE_BYTES,
                                 parents=None, name=f"COMM_RECV_FIRSTTOK_tp{dst_rank}")
             nodes[dst_npu].append(recv_node)
