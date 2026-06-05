@@ -7,6 +7,7 @@ from parser import RunConfig
 from Orchestrator.Orchestrator import Orchestrator
 from Model.InferenceModel import InferenceModel
 from utils import add_dependencies, send, receive
+from naming import (comp_base, pp_name, kv_name, kvreq_name,firsttok_name, decfb_name, comm_tag)
 
 # size of bytes of a pull request message
 REQUEST_BYTES = 8
@@ -74,6 +75,15 @@ class DisaggregatedInference(Orchestrator):
     
     def _get_decode_npu_id(self, pp_stage:int, tp_rank:int) -> int:
         return self.prefill_npus + (pp_stage * self.decode_cfg.tp_size) + tp_rank
+    
+    def _get_prefill_coord(self, npu_id: int) -> Tuple[int,int]: # returns (pp_stage, tp_rank) given an npu_id in the prefill pool
+        tp = self.prefill_cfg.tp_size
+        return (npu_id // tp, npu_id % tp)
+    
+    def _get_decode_coord(self, npu_id: int) -> Tuple[int,int]: # returns (pp_stage, tp_rank) given an npu_id in the decode pool
+        tp = self.decode_cfg.tp_size
+        offset = npu_id - self.prefill_npus
+        return (offset // tp, offset % tp)
 
     # SINGLE SOURCE OF TRUTH for the pg_name strings. They are used both when building comm_groups.json (generate_comm_groups) and when tagging the COMM_COLL nodes (_emit_prefill / _emit_decode).
     def _prefill_tp_pg(self, pp_stage: int) -> str:
@@ -155,10 +165,11 @@ class DisaggregatedInference(Orchestrator):
                 #Receive the activations from the previous stage
                 if stage > 0:
                     prev_stage_npu = npu - tp_size
+                    name=pp_name(pl="p", src_stage=stage-1, dst_stage=stage, sh=rank, it=0)
                     recv_node = receive(
                         sender=prev_stage_npu, receiver=npu, size=self.pp_prefill_bytes,
                         parents=[last_node_per_npu[npu]] if last_node_per_npu[npu] else None,
-                        name=f"COMM_RECV_PREFILL_pp{stage}_tp{rank}"
+                        name=name, tag = comm_tag(name)
                     )
                     nodes[npu].append(recv_node)
                     last_node_per_npu[npu] = recv_node
@@ -167,7 +178,7 @@ class DisaggregatedInference(Orchestrator):
                 for local_layer_idx in range(self.layer_per_stage_prefill):
                     global_layer_idx = (stage*self.layer_per_stage_prefill) + local_layer_idx
                     emit_result = self.prefill_model.prefill(
-                        name=f"COMP_PREFILL_L{global_layer_idx}_pp{stage}_tp{rank}", 
+                        name=comp_base(pl="p", ss=stage, sh=rank, L=global_layer_idx, it=0),
                         layer=global_layer_idx, prompt_lens=self.prompt_lens, pg_name=process_group
                     )
                     if last_node_per_npu[npu]:
@@ -179,10 +190,11 @@ class DisaggregatedInference(Orchestrator):
                 # Send the activations to the next stage
                 if stage < self.prefill_cfg.pp_size - 1:
                     next_stage_npu = npu + tp_size
+                    name=pp_name(pl="p", src_stage=stage, dst_stage=stage+1, sh=rank, it=0)
                     send_node = send(
                         sender=npu, receiver=next_stage_npu, size=self.pp_prefill_bytes,
                         parents=[last_node_per_npu[npu]] if last_node_per_npu[npu] else None,
-                        name=f"COMM_SEND_PREFILL_pp{stage}_tp{rank}"
+                        name=name, tag = comm_tag(name)
                     )
                     nodes[npu].append(send_node)
                     last_node_per_npu[npu] = send_node 
@@ -202,9 +214,12 @@ class DisaggregatedInference(Orchestrator):
         """Emit the streaming transfer of the KV cache for each layer as soon as it is ready in the prefill pool, overlapping communication with the rest of prefill (Splitwise approach)"""
         for layer in range(self.num_layers):
             for (src_npu, dst_npu, size) in self._kv_edges(layer):
-                tag = f"KV_L{layer}_{src_npu}to{dst_npu}"
+                ps,sr = self._get_prefill_coord(src_npu)
+                ds, dr = self._get_decode_coord(dst_npu)
+                name_kv= kv_name(src_stage=ps, dst_stage=ds, ssh=sr, dsh=dr, it=0, L=layer)
+                name_req = kvreq_name(src_stage=ps, dst_stage=ds, ssh=sr, dsh=dr, it=0, L=layer)
                 ready_hook = kv_ready_hooks[(layer, src_npu)]
-                recv_node = self._create_kv_transfer_pair(nodes, src_npu, dst_npu, size, ready_hook, tag, is_pull_explicit)
+                recv_node = self._create_kv_transfer_pair(nodes, src_npu, dst_npu, size, ready_hook, name_kv, name_req, is_pull_explicit)
                 self._stream_recv[(layer, dst_npu)].append(recv_node)
     
     def _emit_bulk_transfer(self, nodes: Dict, last_node_per_npu: Dict, is_pull_explicit: bool) -> None:
@@ -214,47 +229,50 @@ class DisaggregatedInference(Orchestrator):
             for (src_npu, dst_npu, size) in self._kv_edges(layer):
                 aggregated_bytes[(src_npu, dst_npu)] += size
         for (src_npu, dst_npu), size in aggregated_bytes.items():
-            tag = f"KV_BULK_{src_npu}to{dst_npu}"
+            ps,sr = self._get_prefill_coord(src_npu)
+            ds, dr = self._get_decode_coord(dst_npu)
+            name_kv = kv_name(src_stage=ps, dst_stage=ds, ssh=sr, dsh=dr, seg="all", it=0)
+            name_req = kvreq_name(src_stage=ps, dst_stage=ds, ssh=sr, dsh=dr, seg="all", it=0)
             ready_hook = last_node_per_npu[src_npu]
-            recv_node = self._create_kv_transfer_pair(nodes, src_npu, dst_npu, size, ready_hook, tag, is_pull_explicit)
+            recv_node = self._create_kv_transfer_pair(nodes, src_npu, dst_npu, size, ready_hook, name_kv, name_req, is_pull_explicit)
             self._bulk_recv[dst_npu].append(recv_node)
 
-    def _create_kv_transfer_pair(self, nodes: Dict, src_npu: int, dst_npu: int, size: int, ready_hook: object, tag: str, is_pull_explicit: bool) -> object:
+    def _create_kv_transfer_pair(self, nodes: Dict, src_npu: int, dst_npu: int, size: int, ready_hook: object, name_kv: str, name_req: str, is_pull_explicit: bool) -> object:
         """Emit the send and receive nodes for a single KV transfer, with dependencies to ensure the send happens after `ready`. If `pull_explicit` is True, also emit a request SEND/RECV pair before the transfer."""
         if is_pull_explicit:
             #send request
             req_send = send(
                 sender=dst_npu, receiver=src_npu, size=REQUEST_BYTES, 
-                parents=None,name=f"COMM_SEND_KVREQ_{tag}"
+                parents=None,name=name_req, tag=comm_tag(name_req)
             )
             nodes[dst_npu].append(req_send)
             req_recv = receive(
                 sender=dst_npu, receiver=src_npu, size=REQUEST_BYTES, 
-                parents=None, name=f"COMM_RECV_KVREQ_{tag}"
+                parents=None, name=name_req, tag=comm_tag(name_req)
             )
             nodes[src_npu].append(req_recv)
 
             #send KV cache after receiving the request and after the data is ready
             kv_send = send(
                 sender=src_npu, receiver=dst_npu, size=size, 
-                parents=[ready_hook, req_recv], name=f"COMM_SEND_KV_{tag}"
+                parents=[ready_hook, req_recv], name=name_kv, tag=comm_tag(name_kv)
             )
             nodes[src_npu].append(kv_send)
             kv_recv = receive(
                 sender=src_npu, receiver=dst_npu, size=size, 
-                parents=[req_send], name=f"COMM_RECV_KV_{tag}"
+                parents=[req_send], name=name_kv, tag=comm_tag(name_kv)
             )
             nodes[dst_npu].append(kv_recv)
         else:
             #Pull or implicit push: prefill just sends as soon as ready, decode just receives without waiting for an explicit request
             kv_send = send(
                 sender=src_npu, receiver=dst_npu, size=size, 
-                parents=[ready_hook], name=f"COMM_SEND_KV_{tag}"
+                parents=[ready_hook], name=name_kv, tag=comm_tag(name_kv)
             )
             nodes[src_npu].append(kv_send)
             kv_recv = receive(
                 sender=src_npu, receiver=dst_npu, size=size, 
-                parents=None, name=f"COMM_RECV_KV_{tag}"
+                parents=None, name=name_kv, tag=comm_tag(name_kv)
             )
             nodes[dst_npu].append(kv_recv)
 
@@ -281,13 +299,16 @@ class DisaggregatedInference(Orchestrator):
         for dst_rank in range(self.decode_cfg.tp_size):
             src_npu = self._get_prefill_npu_id(last_stage, dst_rank % tp_p)
             dst_npu = self._get_decode_npu_id(0, dst_rank)
+            name= firsttok_name(src_stage=last_stage, dst_stage=0, dsh=dst_rank, it=0)
             send_node = send(sender=src_npu, receiver=dst_npu, size=SAMPLE_BYTES,
                             parents=[last_node_per_npu[src_npu]],
-                            name=f"COMM_SEND_FIRSTTOK_tp{dst_rank}")
+                            name=name, tag=comm_tag(name)
+                            )
             nodes[src_npu].append(send_node)
             #last_node_per_npu[src_npu] = send_node
             recv_node = receive(sender=src_npu, receiver=dst_npu, size=SAMPLE_BYTES,
-                                parents=None, name=f"COMM_RECV_FIRSTTOK_tp{dst_rank}")
+                                parents=None, name=name, tag=comm_tag(name)
+                                )
             nodes[dst_npu].append(recv_node)
             token_recv_per_npu[dst_npu] = recv_node
         return token_recv_per_npu
@@ -316,10 +337,11 @@ class DisaggregatedInference(Orchestrator):
 
                     #Receives the activations from the previous stage (or the KV cache for the first stage)
                     if stage > 0:
+                        name = pp_name(pl="d", src_stage=stage-1, dst_stage=stage, sh=rank, it=step)
                         recv_node = receive(
                             sender=npu - tp_size, receiver=npu, size=pp_decode_bytes, 
                             parents=[last_node_per_npu[npu]] if last_node_per_npu[npu] else None,
-                            name=f"COMM_RECV_DECODE_step{step}_pp{stage}_tp{rank}"
+                            name=name, tag=comm_tag(name)
                         )
                         nodes[npu].append(recv_node)
                         last_node_per_npu[npu] = recv_node
@@ -328,7 +350,7 @@ class DisaggregatedInference(Orchestrator):
                     for local_layer_idx in range(self.layer_per_stage_decode):
                         global_layer_idx = stage*self.layer_per_stage_decode + local_layer_idx
                         emit_result = self.decode_model.decode(
-                            name=f"COMP_DECODE_step{step}_L{global_layer_idx}_pp{stage}_tp{rank}", 
+                            name=comp_base(pl="d", ss=stage, sh=rank, L=global_layer_idx, it=step),
                             layer=global_layer_idx, kv_lens=current_kv_lens, pg_name=process_group
                         )
 
@@ -351,19 +373,20 @@ class DisaggregatedInference(Orchestrator):
                     
                     if stage < self.decode_cfg.pp_size - 1:
                         next_stage_npu = npu + tp_size
+                        name = pp_name(pl="d", src_stage=stage, dst_stage=stage+1, sh=rank, it=step)
                         send_node = send(
                             sender=npu, receiver=next_stage_npu, size=pp_decode_bytes, 
                             parents=[last_node_per_npu[npu]] if last_node_per_npu[npu] else None,
-                            name=f"COMM_SEND_DECODE_step{step}_pp{stage}_tp{rank}"
+                            name=name, tag=comm_tag(name)
                         )
                         nodes[npu].append(send_node)
                         last_node_per_npu[npu] = send_node
             
             # Autoregressive serizialization
             if step < self.max_decode_steps - 1:
-                self._emit_autoregressive_feedback(nodes, last_node_per_npu, label=f"DECODE_step{step}")
+                self._emit_autoregressive_feedback(nodes, last_node_per_npu, step)
     
-    def _emit_autoregressive_feedback(self, nodes: Dict, last_node_per_npu: Dict, label: str) -> None:
+    def _emit_autoregressive_feedback(self, nodes: Dict, last_node_per_npu: Dict, step: int) -> None:
         """The token sampled at the tail PP stage must reach the head stage before the next decode step starts"""
         if not (self.serialize_decode and self.decode_cfg.pp_size > 1):
             # With pp_d == 1 the per-NPU chain already serialises steps, so this is only needed for pp_d > 1.
@@ -372,12 +395,13 @@ class DisaggregatedInference(Orchestrator):
         tp_size = self.decode_cfg.tp_size
         for rank in range(tp_size):
             src_npu = self._get_decode_npu_id(self.decode_cfg.pp_size - 1, rank)
-            dst_npu = self._get_decode_npu_id(0, rank) 
+            dst_npu = self._get_decode_npu_id(0, rank)
+            name = decfb_name(pl="d", src_stage=self.decode_cfg.pp_size - 1, dst_stage=0, sh=rank, it=step)
 
             send_node = send(
                 sender=src_npu, receiver=dst_npu, size=SAMPLE_BYTES, 
                 parents=[last_node_per_npu[src_npu]] if last_node_per_npu[src_npu] else None,
-                name=f"COMM_SEND_SAMPLE_{label}_tp{rank}"
+                name=name, tag=comm_tag(name)
             )
             nodes[src_npu].append(send_node)
             last_node_per_npu[src_npu] = send_node
@@ -385,7 +409,7 @@ class DisaggregatedInference(Orchestrator):
             recv_node = receive(
                 sender=src_npu, receiver=dst_npu, size=SAMPLE_BYTES, 
                 parents=[last_node_per_npu[dst_npu]] if last_node_per_npu[dst_npu] else None,
-                name=f"COMM_RECV_SAMPLE_{label}_tp{rank}"
+                name=name, tag=comm_tag(name)
             )
             nodes[dst_npu].append(recv_node)
             last_node_per_npu[dst_npu] = recv_node

@@ -3,6 +3,7 @@ from chakra.schema.protobuf.et_def_pb2 import Node as ChakraNode
 
 from Layer.InferenceLayer import InferenceLayer, LayerEmission
 from utils import compute, allreduce
+from naming import comp_name, coll_name
 
 # With tensor parallelism, each TP rank does 1/tp of the FLOPs and holds 1/tp of the weights, but 2 all reduce operations
 # are required per layer (after output projection and FFW down projection) to reassemble the partial sums.
@@ -74,23 +75,23 @@ class TransformerInferenceLayer(InferenceLayer):
 
         nodes: List[ChakraNode] = []
 
-        attn = compute(attn_flops, attn_tensor, name=f"{name}_attn")
+        attn = compute(attn_flops, attn_tensor, name=comp_name(name, "attn"))
         nodes.append(attn)
         attn_end = attn
 
         if self.tp_size > 1:
-            attn_ar = allreduce(ar_size, pg_name=pg_name, parents=[attn], name=f"{name}_attn_ar")
+            attn_ar = allreduce(ar_size, pg_name=pg_name, parents=[attn], name=coll_name(name, "attn"))
             nodes.append(attn_ar)
             attn_end = attn_ar
 
         kv_ready = attn_end
 
-        ffw = compute(ffw_flops, ffw_tensor, parents=[attn_end], name=f"{name}_ffw")
+        ffw = compute(ffw_flops, ffw_tensor, parents=[attn_end], name=comp_name(name, "ffw"))
         nodes.append(ffw)
         tail = ffw
 
         if self.tp_size > 1:
-            ffw_ar = allreduce(ar_size, pg_name=pg_name, parents=[ffw], name=f"{name}_ffw_ar")
+            ffw_ar = allreduce(ar_size, pg_name=pg_name, parents=[ffw], name=coll_name(name, "ffw"))
             nodes.append(ffw_ar)
             tail = ffw_ar
 
