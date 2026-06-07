@@ -3,11 +3,11 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 from chakra.schema.protobuf.et_def_pb2 import GlobalMetadata
 
-from parser import RunConfig
+from Utils.parser import RunConfig
 from Orchestrator.Orchestrator import Orchestrator
 from Model.InferenceModel import InferenceModel
-from utils import add_dependencies, send, receive
-from naming import (comp_base, pp_name, kv_name, kvreq_name,firsttok_name, decfb_name, comm_tag)
+from Utils.utils import add_dependencies, send, receive
+from Utils.naming import (comp_base, pp_name, kv_name, kvreq_name,firsttok_name, decfb_name, comm_tag)
 
 # size of bytes of a pull request message
 REQUEST_BYTES = 8
@@ -85,12 +85,13 @@ class DisaggregatedInference(Orchestrator):
         offset = npu_id - self.prefill_npus
         return (offset // tp, offset % tp)
 
-    # SINGLE SOURCE OF TRUTH for the pg_name strings. They are used both when building comm_groups.json (generate_comm_groups) and when tagging the COMM_COLL nodes (_emit_prefill / _emit_decode).
+    # SINGLE SOURCE OF TRUTH for the pg_names. They are used both when building comm_groups.json (generate_comm_groups) and when tagging the COMM_COLL nodes (_emit_prefill / _emit_decode).
+    #They must be integers since astra-sim only supports integer pg names
     def _prefill_tp_pg(self, pp_stage: int) -> str:
-        return f"prefill_tp_{pp_stage}"
+        return str(pp_stage)
 
     def _decode_tp_pg(self, pp_stage: int) -> str:
-        return f"decode_tp_{pp_stage}"
+        return str(self.prefill_cfg.pp_size + pp_stage)
 
     def generate_comm_groups(self) -> dict:
         groups: Dict[str, List[int]] = {}

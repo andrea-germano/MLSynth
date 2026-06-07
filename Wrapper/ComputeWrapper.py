@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from Wrapper.Wrapper import Wrapper
-from utils import compute
+from Utils.utils import compute
 from chakra.schema.protobuf.et_def_pb2 import (
     Node as ChakraNode,
     NodeType as ChakraNodeType,

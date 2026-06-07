@@ -16,7 +16,7 @@
 from collections import defaultdict
 from Model.Model import Model
 from Orchestrator.Orchestrator import Orchestrator
-from utils import add_dependencies, allreduce, receive, send
+from Utils.utils import add_dependencies, allreduce, receive, send
 from chakra.schema.protobuf.et_def_pb2 import (
     GlobalMetadata,
 )

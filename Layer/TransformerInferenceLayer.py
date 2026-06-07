@@ -2,8 +2,8 @@ from typing import List
 from chakra.schema.protobuf.et_def_pb2 import Node as ChakraNode
 
 from Layer.InferenceLayer import InferenceLayer, LayerEmission
-from utils import compute, allreduce
-from naming import comp_name, coll_name
+from Utils.utils import compute, allreduce
+from Utils.naming import comp_name, coll_name
 
 # With tensor parallelism, each TP rank does 1/tp of the FLOPs and holds 1/tp of the weights, but 2 all reduce operations
 # are required per layer (after output projection and FFW down projection) to reassemble the partial sums.

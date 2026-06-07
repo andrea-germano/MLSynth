@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from Layer.Layer import Layer
-from utils import allreduce, compute
+from Utils.utils import allreduce, compute
 from chakra.schema.protobuf.et_def_pb2 import (
     Node as ChakraNode,
 )
