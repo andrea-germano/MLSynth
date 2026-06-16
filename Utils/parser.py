@@ -19,7 +19,7 @@ class ModelConfig:
     num_attention_heads: int = 0 #default is q_dim/kv_dim = hidden_size
     num_kv_heads: int = 0 #set to num_attention heads for MHA, otherwise it's GQA
     head_dim: int = 0  #default is hidden_size//num_attention_heads
-    intermidiate_size: int = 0 #default is 4*hidden_size
+    intermediate_size: int = 0 #default is 4*hidden_size
     ffn_type: str = "classic" # for now only supported classic or swiglu
 
     @property
@@ -133,6 +133,8 @@ def _build_parallelism(data: dict, model: ModelConfig) -> tuple[ParallelismConfi
             raise ValueError(f"{label}: num_layers ({model.num_layers}) not divisible by pp_size ({pp}).")
         if model.hidden_size % tp != 0:
             raise ValueError(f"{label}: hidden_size ({model.hidden_size}) not divisible by tp_size ({tp}).")
+        if model.num_kv_heads and max(tp, model.num_kv_heads) % min(tp, model.num_kv_heads) != 0:
+            raise ValueError(f"{label}: tp_size ({tp}) and num_kv_heads ({model.num_kv_heads}) must be multiples of each other (GQA).")        
         return ParallelismConfig(tp_size=tp, pp_size=pp)
 
     if "prefill_parallelism" in data or "decode_parallelism" in data:

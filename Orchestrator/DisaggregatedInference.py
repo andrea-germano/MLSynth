@@ -62,7 +62,8 @@ class DisaggregatedInference(Orchestrator):
         self.max_decode_steps = max(req.gen_len for req in self.requests)
         self.total_prompt_tokens = sum(self.prompt_lens)
 
-        self.kv_bytes_per_layer = int(self.scale * 2 * self.hidden_size * self.bytes_per_val * self.total_prompt_tokens)
+        self.kv_dim=run.model.key_value_dim # = hidden for MHA and kv_heads*head_dim for GQA
+        self.kv_bytes_per_layer = int(self.scale * 2 * self.kv_dim * self.bytes_per_val * self.total_prompt_tokens)
 
         # PP aactivations transfer size
         self.pp_prefill_bytes= int(self.scale * self.total_prompt_tokens * self.hidden_size * self.bytes_per_val)
