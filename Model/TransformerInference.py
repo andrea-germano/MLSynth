@@ -11,6 +11,10 @@ class TransformerInference(InferenceModel):
         self._parallelism = parallelism
         self._layer = TransformerInferenceLayer(
             hidden_size=model_cfg.hidden_size,
+            query_dim=model_cfg.query_dim,
+            key_value_dim=model_cfg.key_value_dim,
+            ffn_intermediate_size=model_cfg.ffn_intermediate_size,
+            ffn_type=model_cfg.ffn_type,
             bytes_per_val=model_cfg.bytes_per_val,
             tp_size=parallelism.tp_size,
             scale=model_cfg.scale,

@@ -14,86 +14,116 @@ from Utils.naming import comp_name, coll_name
 
 #! Forse possiamo omettere la lettura e la scrittura degli input e output activations, perchè spesso sono ottimizzati e non sono presenti
 class TransformerInferenceLayer(InferenceLayer):
-    """ A single dense inference block, accounting for FLOPs and activations of a single transformer layer, for both prefill and decode phases"""
+    """ A single dense inference block, accounting for FLOPs and activations of a single transformer layer, for both prefill and decode phases
+    Attention: MHA and GQA (via query_dim / key_value_dim)
+    FFN: classic (2 matrix multiplications) or SwiGLU (3 matrix multiplications)"""
 
-    def __init__(self, hidden_size: int, bytes_per_val: int = 2, tp_size: int = 1, scale: float = 1.0):
+    def __init__(self, hidden_size: int, query_dim: int | None = None,
+                key_value_dim: int | None = None,
+                ffn_intermediate_size: int | None = None,
+                ffn_type: str = "classic", 
+                bytes_per_val: int = 2, tp_size: int = 1, scale: float = 1.0):
         self.hidden_size = hidden_size
+        self.query_dim = query_dim if query_dim is not None else hidden_size
+        self.key_value_dim = key_value_dim if key_value_dim is not None else hidden_size
+        self.ffn_intermediate_size = ffn_intermediate_size if ffn_intermediate_size is not None else 4 * hidden_size
+        self.ffn_type = ffn_type
         self.bytes_per_val = bytes_per_val
         self.tp_size = tp_size
         self.scale = scale
 
-    def prefill(self, name: str, pg_name: str | None, prompt_lens: List[int]) -> LayerEmission:
-        d, b, tp= self.hidden_size, self.bytes_per_val, self.tp_size
-        T = sum(prompt_lens)               # total prompt tokens (replaces B*S)
-        Q = sum(l * l for l in prompt_lens)  # replaces B*S*S in the score matmuls
+        self.attn_weight_elems = (
+            2 * hidden_size * self.query_dim       # Q proj + O proj
+            + 2 * hidden_size * self.key_value_dim # K proj + V proj
+        )
+        num_ffn_matrices = 3 if ffn_type == "swiglu" else 2
+        self.ffn_weight_elems = num_ffn_matrices * hidden_size * self.ffn_intermediate_size
+        self.ffn_flops_per_token = 2* num_ffn_matrices * hidden_size * self.ffn_intermediate_size
 
-        # Input and output activations are not sharded since they are needed in full for the attention and MLP computations, so each TP rank holds a full copy of them
-        attn_tensor = int(self.scale*(
-            4*d*d*b // tp #weights read for q,k,v,o
-            + T*d*b #input activations read
-            + 2*T*d*b // tp #KV cache written at the end of the attention block
-            + T*d*b #output activations written
-        ))   
-                                                                            
-        attn_flops = int(self.scale * (8*T*d*d + 4*Q*d) // tp) # 8*B*S*d^2 = 6B*S*d^2 for q,k,v matmul + 2B*S*d^2 for output projection, 4*B*S*S*d accounts for attention scores and context vector matmuls
+    def prefill(self, name, pg_name, prompt_lens):
+        b = self.bytes_per_val
 
-        ffwd_tensor = int(self.scale * (
-            8*d*d*b // tp # 2 matrices for the MLP (each big 4d^2, since they are dx4d and 4dxd)
-            + 2*T*d*b # accounts for the input and output activations, which are read and written during the MLP block
-        ))   #? This should not make big difference since with roofline model the compute should be dominant, right?
+        total_prompt_tokens = sum(prompt_lens)
+        score_entries = sum(length * length for length in prompt_lens)   # Σ l²: coppie query–key
 
-        ffwd_flops = int(self.scale * (16*T*d*d) // tp) # 16*T*d^2 for the two matrix multiplications in the MLP, condidering d_ff=4*d
-        return self._emit(name=name, pg_name=pg_name, attn_flops=attn_flops, attn_tensor=attn_tensor, ffw_flops=ffwd_flops, ffw_tensor=ffwd_tensor, ar_tokens=T) # all reduce message size is the size of the output activation (only one token)
+        attn_flops = int(self.scale * (
+            2 * total_prompt_tokens * self.hidden_size * self.query_dim       # Q projection
+            + 4 * total_prompt_tokens * self.hidden_size * self.key_value_dim # K+V projections
+            + 2 * total_prompt_tokens * self.query_dim * self.hidden_size     # O projections
+            + 4 * score_entries * self.query_dim                         # QKᵀ + (scores · V)
+        ) // self.tp_size)
 
-    def decode(self, name: str, pg_name: str | None, kv_lens: List[int]) -> LayerEmission:
-        d, b, tp = self.hidden_size, self.bytes_per_val, self.tp_size
-        B = len(kv_lens) # batch size (number of requests being processed)
-        K = sum(kv_lens) # total number of tokens in the KV cache across the batch (replaces B*S_kv)
-
-        attn_tensor = int(self.scale * (
-            4*d*d*b // tp #weights read for q,k,v,o
-            + B*1*d*b #input activation read for the single token being processed in the current decode step
-            + 2*B*K*d*b // tp #! KV cache read (makes this memory bound), sharded across TP ranks since K and V are produced by column-parallel projections
-            + 2*B*1*d*b // tp  #new K,V written to the KV cache at the end of the attention block
-            + B*1*d*b #output activation written 
-        ))
-        
-        attn_flops = int(self.scale * (8*B*1*d*d + 4*B*1*K*d) // tp) # 8*B*1*d^2 = 6B*1*d^2 for q,k,v matmul (input only one token)+ 2B*1*d^2 for output projection, 4*B*1*S_kv*d accounts for attention scores and context vector matmuls with KV cache of length S_kv
-    
-        ffwd_tensor = int(self.scale * (
-            8*d*d*b // tp #weights read for the 2 MLP matrices
-            + B*1*d*b #input activation read for the single token being processed 
-            + B*1*d*b #output activation written
+        attn_bytes = int(self.scale * (
+            self.attn_weight_elems * b // self.tp_size                 # Q,K,V,O weights (sharded)
+            + total_prompt_tokens * self.hidden_size * b               # input activations
+            + 2 * total_prompt_tokens * self.key_value_dim * b // self.tp_size  # KV written to cache
+            + total_prompt_tokens * self.hidden_size * b               # output activations
         ))
 
-        ffwd_flops = int(self.scale * (16*B*1*d*d) // tp) # 16*B*1*d^2 for the two matrix multiplications in the MLP
-        return self._emit(name=name, pg_name=pg_name, attn_flops=attn_flops, attn_tensor=attn_tensor, ffw_flops=ffwd_flops, ffw_tensor=ffwd_tensor, ar_tokens=B)
+        ffn_flops = int(self.scale * (total_prompt_tokens * self.ffn_flops_per_token) // self.tp_size)
+        ffn_bytes = int(self.scale * (
+            self.ffn_weight_elems * b // self.tp_size                  # FFN weights (sharded)
+            + 2 * total_prompt_tokens * self.hidden_size * b           # input + output activations
+        ))
+
+        return self._emit(name, pg_name, attn_flops, attn_bytes, ffn_flops, ffn_bytes,
+                          allreduce_tokens=total_prompt_tokens)
+
+    def decode(self, name, pg_name, kv_lens):
+        b = self.bytes_per_val
+
+        batch_size = len(kv_lens)
+        total_kv_tokens = sum(kv_lens)   
+
+        attn_flops = int(self.scale * (
+            2 * batch_size * self.hidden_size * self.query_dim       # Q projection (1 token/richiesta)
+            + 4 * batch_size * self.hidden_size * self.key_value_dim # K+V projections
+            + 2 * batch_size * self.query_dim * self.hidden_size     # O projections
+            + 4 * total_kv_tokens * self.query_dim              # scores + context su tutta la KV
+        ) // self.tp_size)
+
+        attn_bytes = int(self.scale * (
+            self.attn_weight_elems * b // self.tp_size                  # weights
+            + batch_size * self.hidden_size * b                         # input activation
+            + 2 * total_kv_tokens * self.key_value_dim * b // self.tp_size   # reading KV cache (memory bound)
+            + 2 * batch_size * self.key_value_dim * b // self.tp_size        # new K,V written
+            + batch_size * self.hidden_size * b                         # output activation
+        ))
+
+        ffn_flops = int(self.scale * (batch_size * self.ffn_flops_per_token) // self.tp_size)
+        ffn_bytes = int(self.scale * (
+            self.ffn_weight_elems * b // self.tp_size
+            + batch_size * self.hidden_size * b
+            + batch_size * self.hidden_size * b
+        ))
+
+        return self._emit(name, pg_name, attn_flops, attn_bytes, ffn_flops, ffn_bytes, allreduce_tokens=batch_size)
+
     
-    def _emit(self, name: str, pg_name: str | None, attn_flops: int, attn_tensor: int, ffw_flops: int, ffw_tensor: int, ar_tokens: int) -> LayerEmission:
-        d, b = self.hidden_size, self.bytes_per_val
-        ar_size = int(self.scale * ar_tokens * d * b)  # all-reduce message size
+    def _emit(self, name, pg_name, attn_flops, attn_bytes, ffn_flops, ffn_bytes, allreduce_tokens):
+        allreduce_bytes = int(self.scale * allreduce_tokens * self.hidden_size * self.bytes_per_val)
 
         nodes: List[ChakraNode] = []
 
-        attn = compute(attn_flops, attn_tensor, name=comp_name(name, "attn"))
+        attn = compute(attn_flops, attn_bytes, name=f"{name}_attn")
         nodes.append(attn)
         attn_end = attn
 
         if self.tp_size > 1:
-            attn_ar = allreduce(ar_size, pg_name=pg_name, parents=[attn], name=coll_name(name, "attn"))
+            attn_ar = allreduce(allreduce_bytes, pg_name=pg_name, parents=[attn], name=f"{name}_attn_ar")
             nodes.append(attn_ar)
             attn_end = attn_ar
 
         kv_ready = attn_end
 
-        ffw = compute(ffw_flops, ffw_tensor, parents=[attn_end], name=comp_name(name, "ffw"))
-        nodes.append(ffw)
-        tail = ffw
+        ffn = compute(ffn_flops, ffn_bytes, parents=[attn_end], name=f"{name}_ffw")
+        nodes.append(ffn)
+        tail = ffn
 
         if self.tp_size > 1:
-            ffw_ar = allreduce(ar_size, pg_name=pg_name, parents=[ffw], name=coll_name(name, "ffw"))
-            nodes.append(ffw_ar)
-            tail = ffw_ar
+            ffn_ar = allreduce(allreduce_bytes, pg_name=pg_name, parents=[ffn], name=f"{name}_ffw_ar")
+            nodes.append(ffn_ar)
+            tail = ffn_ar
 
         return LayerEmission(nodes=nodes, tail=tail, kv_ready=kv_ready)
 

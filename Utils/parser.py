@@ -15,6 +15,31 @@ class ModelConfig:
     vocab_size: int
     bytes_per_val: int = 2
     scale: float = 1.0
+    
+    num_attention_heads: int = 0 #default is q_dim/kv_dim = hidden_size
+    num_kv_heads: int = 0 #set to num_attention heads for MHA, otherwise it's GQA
+    head_dim: int = 0  #default is hidden_size//num_attention_heads
+    intermidiate_size: int = 0 #default is 4*hidden_size
+    ffn_type: str = "classic" # for now only supported classic or swiglu
+
+    @property
+    def effective_head_dim(self) -> int:
+        if self.head_dim:
+            return self.head_dim
+        return self.hidden_size // self.num_attention_heads if self.num_attention_heads else 0
+
+    @property
+    def query_dim(self) -> int:
+        return self.num_attention_heads * self.effective_head_dim if self.num_attention_heads else self.hidden_size
+
+    @property
+    def key_value_dim(self) -> int:
+        num_kv_heads = self.num_kv_heads or self.num_attention_heads
+        return num_kv_heads * self.effective_head_dim if self.num_attention_heads else self.hidden_size
+
+    @property
+    def ffn_intermediate_size(self) -> int:
+        return self.intermediate_size or 4 * self.hidden_size
 
 @dataclass(frozen=True) 
 class ParallelismConfig:
@@ -71,6 +96,10 @@ class RunConfig:
 def _build_model(data: dict) -> ModelConfig:
     _require(data, ("name", "num_layers", "hidden_size", "vocab_size", "bytes_per_val"), ctx="model")
 
+    ffn_type = str(data.get("ffn_type", "classic")).lower()
+    if ffn_type not in ("classic", "swiglu"):
+        raise ValueError(f"ffn_type must be 'classic' or 'swiglu', got {ffn_type!r}")
+
     cfg= ModelConfig(
         name=str(data["name"]),
         num_layers=int(data["num_layers"]),
@@ -78,11 +107,18 @@ def _build_model(data: dict) -> ModelConfig:
         vocab_size=int(data["vocab_size"]),
         bytes_per_val=int(data["bytes_per_val"]),
         scale=float(data.get("scale", 1.0)),
+        num_attention_heads=int(data.get("num_attention_heads", 0)),
+        num_kv_heads=int(data.get("num_kv_heads", 0)),
+        head_dim=int(data.get("head_dim", 0)),
+        intermediate_size=int(data.get("intermediate_size", 0)),
+        ffn_type=ffn_type,
     )
     if min(cfg.num_layers, cfg.hidden_size, cfg.vocab_size, cfg.bytes_per_val) <= 0:
         raise ValueError("All model parameters must be positive")
     if cfg.bytes_per_val not in (1, 2, 4, 8):
         raise ValueError(f"bytes_per_val must be one of 1/2/4/8, got {cfg.bytes_per_val}")
+    if cfg.num_attention_heads and cfg.num_kv_heads and cfg.num_attention_heads % cfg.num_kv_heads != 0:
+        raise ValueError("num_attention_heads must be divisible by num_kv_heads (GQA).")
     return cfg
 
 def _build_parallelism(data: dict, model: ModelConfig) -> tuple[ParallelismConfig, ParallelismConfig]:
