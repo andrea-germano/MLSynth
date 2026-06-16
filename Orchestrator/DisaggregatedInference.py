@@ -89,10 +89,10 @@ class DisaggregatedInference(Orchestrator):
     # SINGLE SOURCE OF TRUTH for the pg_names. They are used both when building comm_groups.json (generate_comm_groups) and when tagging the COMM_COLL nodes (_emit_prefill / _emit_decode).
     #They must be integers since astra-sim only supports integer pg names
     def _prefill_tp_pg(self, pp_stage: int) -> str:
-        return str(pp_stage)
+        return str(pp_stage+1)
 
     def _decode_tp_pg(self, pp_stage: int) -> str:
-        return str(self.prefill_cfg.pp_size + pp_stage)
+        return str(self.prefill_cfg.pp_size + pp_stage+1)
 
     def generate_comm_groups(self) -> dict:
         groups: Dict[str, List[int]] = {}

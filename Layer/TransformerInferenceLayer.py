@@ -40,7 +40,7 @@ class TransformerInferenceLayer(InferenceLayer):
         self.ffn_weight_elems = num_ffn_matrices * hidden_size * self.ffn_intermediate_size
         self.ffn_flops_per_token = 2* num_ffn_matrices * hidden_size * self.ffn_intermediate_size
 
-    def prefill(self, name, pg_name, prompt_lens):
+    def prefill(self, name: str, pg_name: str | None, prompt_lens: List[int]) -> LayerEmission:
         b = self.bytes_per_val
 
         total_prompt_tokens = sum(prompt_lens)
@@ -69,7 +69,7 @@ class TransformerInferenceLayer(InferenceLayer):
         return self._emit(name, pg_name, attn_flops, attn_bytes, ffn_flops, ffn_bytes,
                           allreduce_tokens=total_prompt_tokens)
 
-    def decode(self, name, pg_name, kv_lens):
+    def decode(self, name: str, pg_name: str | None, kv_lens: List[int]) -> LayerEmission:
         b = self.bytes_per_val
 
         batch_size = len(kv_lens)
@@ -100,28 +100,28 @@ class TransformerInferenceLayer(InferenceLayer):
         return self._emit(name, pg_name, attn_flops, attn_bytes, ffn_flops, ffn_bytes, allreduce_tokens=batch_size)
 
     
-    def _emit(self, name, pg_name, attn_flops, attn_bytes, ffn_flops, ffn_bytes, allreduce_tokens):
+    def _emit(self, name: str, pg_name: str | None, attn_flops: int, attn_bytes: int, ffn_flops: int, ffn_bytes: int, allreduce_tokens: int) -> LayerEmission:
         allreduce_bytes = int(self.scale * allreduce_tokens * self.hidden_size * self.bytes_per_val)
 
         nodes: List[ChakraNode] = []
 
-        attn = compute(attn_flops, attn_bytes, name=f"{name}_attn")
+        attn = compute(attn_flops, attn_bytes, name=comp_name(name, "attn"))
         nodes.append(attn)
         attn_end = attn
 
         if self.tp_size > 1:
-            attn_ar = allreduce(allreduce_bytes, pg_name=pg_name, parents=[attn], name=f"{name}_attn_ar")
+            attn_ar = allreduce(allreduce_bytes, pg_name=pg_name, parents=[attn], name=coll_name(name, "attn"))
             nodes.append(attn_ar)
             attn_end = attn_ar
 
         kv_ready = attn_end
 
-        ffn = compute(ffn_flops, ffn_bytes, parents=[attn_end], name=f"{name}_ffw")
-        nodes.append(ffn)
-        tail = ffn
+        ffw = compute(ffn_flops, ffn_bytes, parents=[attn_end], name=comp_name(name, "ffw"))
+        nodes.append(ffw)
+        tail = ffw
 
         if self.tp_size > 1:
-            ffn_ar = allreduce(allreduce_bytes, pg_name=pg_name, parents=[ffn], name=f"{name}_ffw_ar")
+            ffn_ar = allreduce(allreduce_bytes, pg_name=pg_name, parents=[ffw], name=coll_name(name, "ffw"))
             nodes.append(ffn_ar)
             tail = ffn_ar
 
