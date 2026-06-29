@@ -50,7 +50,7 @@ def main(argv = None) -> int:
     print(f" decode  pool : tp={run.decode.tp_size} pp={run.decode.pp_size} ({run.decode.num_npus} npus)")
     print(f" total npus : {len(nodes)}")
     print(f" requests : {len(run.inference.requests)} decode steps : {orch.max_decode_steps}")
-    print(f" kv transfer : {kv.mode}/{kv.direction} {' (explicit req)' if kv.direction == 'pull' and kv.explicit_request else ''}")
+    print(f" kv transfer : {kv}")
     print(f" comm_groups : {list(comm_groups.keys()) or 'none'}")
     return 0
 

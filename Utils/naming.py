@@ -5,8 +5,8 @@ _ORDER = ("pl", # stands for pool --> prefill (p) or decode (d)
            "ss", # stands for scr pp stage
            "ds", # stands for dst pp stage
            "sh", # stands for tp shard id
-           "ssh", # stands for src tp shard id (for kv/kvreq, where src and dst differ)
-           "dsh", # stands for dst tp shard id (for kv/kvreq, where src and dst differ)
+           "ssh", # stands for src tp shard id (for kv, where src and dst differ)
+           "dsh", # stands for dst tp shard id (for kv, where src and dst differ)
            "L", # stands for layer
            "seg", # stands for range of layers
            "op", # operation performed: attn/ffw/ecc
@@ -41,9 +41,6 @@ def pp_name(*, pl, src_stage, dst_stage, sh, it) -> str:
 
 def kv_name(*, src_stage, dst_stage, ssh, dsh, it, L=None, seg=None) -> str:
     return _assemble("KV", dict(ss=src_stage, ds=dst_stage, ssh=ssh, dsh=dsh, L=L, seg=seg, it=it))
-
-def kvreq_name(*, src_stage, dst_stage, ssh, dsh, it, L=None, seg=None) -> str:
-    return _assemble("KVREQ", dict(ss=src_stage, ds=dst_stage, ssh=ssh, dsh=dsh, L=L, seg=seg, it=it))
 
 def firsttok_name(*, src_stage, dst_stage, dsh, it) -> str:
     return _assemble("FIRSTTOK", dict(ss=src_stage, ds=dst_stage, dsh=dsh, it=it))

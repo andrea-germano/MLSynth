@@ -1,28 +1,27 @@
 model:
-  name: "transformer_disagg_demo"
-  num_layers: 4
-  vocab_size: 1024
-  hidden_size: 128
-  bytes_per_val: 2
+  name: "llama31_70B"
+  num_layers: 80
+  hidden_size: 8192
+  num_attention_heads: 64
+  num_kv_heads: 8           # GQA (8 KV head)
+  head_dim: 128             # = 8192/64
+  intermediate_size: 28672  # SwiGLU
+  ffn_type: swiglu
+  vocab_size: 128256
+  bytes_per_val: 2          # bf16
   scale: 1.0
 
-# Different parallelism for the two pools. KV resharding handles the TP
-# mismatch (one TP size must divide the other).
 prefill_parallelism:
-  tp_size: 2
+  tp_size: 4
   pp_size: 2
 
 decode_parallelism:
-  tp_size: 1
-  pp_size: 2
+  tp_size: 8
+  pp_size: 1
 
 inference:
   serialize_decode_iterations: true
-
-  kv_transfer:
-    mode: streaming        # bulk | streaming
-    direction: pull        # push | pull
-    explicit_request: true # only used when direction == pull
+  kv_transfer: streaming   # bulk | streaming
 
   # The static "blob" of requests (no arrival times, no continuous batching).
   # Heterogeneous prompt / generation lengths are allowed.
@@ -30,7 +29,7 @@ inference:
     - { prompt_len: 16, gen_len: 4 }
     - { prompt_len: 8,  gen_len: 6 }
     - { prompt_len: 32, gen_len: 2 }
-
+  
   # Homogeneous shorthand (use instead of `requests`):
   # num_requests: 4
   # prompt_len: 16

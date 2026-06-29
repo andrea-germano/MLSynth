@@ -7,10 +7,8 @@ from Utils.parser import RunConfig
 from Orchestrator.Orchestrator import Orchestrator
 from Model.InferenceModel import InferenceModel
 from Utils.utils import add_dependencies, send, receive
-from Utils.naming import (comp_base, pp_name, kv_name, kvreq_name,firsttok_name, decfb_name, comm_tag)
+from Utils.naming import (comp_base, pp_name, kv_name, firsttok_name, decfb_name, comm_tag)
 
-# size of bytes of a pull request message
-REQUEST_BYTES = 8
 # size of bytes of the sampled token feedback (used for serialization of decode iterations and for the first token handoff from prefill to decode)
 #! Maybe this should be calculated as the size of lm_head * bytes_per_val * scale, to more accurately reflect the size of the autoregressive feedback, but for now we keep it fixed and small as it is only used for synchronization and does not carry actual data in this model of the system.
 SAMPLE_BYTES = 8
@@ -29,7 +27,7 @@ class DisaggregatedInference(Orchestrator):
 
         self.prefill_cfg = run.prefill
         self.decode_cfg = run.decode
-        self.kv_cfg = run.inference.kv_transfer
+        self.kv_mode = run.inference.kv_transfer
         self.serialize_decode = run.inference.serialize_decode_iterations
 
         #different views of the same model with different parallelism configs for prefill and decode pools, same model_cfg shared by identity
@@ -206,84 +204,57 @@ class DisaggregatedInference(Orchestrator):
     # Second phase: KV transfer from prefill to decode
     # ------------------------------------------------------------------ #
     def _emit_kv_transfer(self, nodes: Dict, last_node_per_npu: Dict, kv_ready_hooks: Dict) -> None:
-        is_pull_explicit = (self.kv_cfg.direction == "pull" and self.kv_cfg.explicit_request)
-        if self.kv_cfg.mode == "streaming":
-            self._emit_streaming_transfer(nodes, kv_ready_hooks, is_pull_explicit)
+        if self.kv_mode == "streaming":
+            self._emit_streaming_transfer(nodes, kv_ready_hooks)
         else:
-            self._emit_bulk_transfer(nodes, last_node_per_npu, is_pull_explicit)
+            self._emit_bulk_transfer(nodes, last_node_per_npu)
 
-    def _emit_streaming_transfer(self, nodes: Dict, kv_ready_hooks: Dict, is_pull_explicit: bool) -> None:
+    def _emit_streaming_transfer(self, nodes: Dict, kv_ready_hooks: Dict) -> None:
         """Emit the streaming transfer of the KV cache for each layer as soon as it is ready in the prefill pool, overlapping communication with the rest of prefill (Splitwise approach)"""
         for layer in range(self.num_layers):
             for (src_npu, dst_npu, size) in self._kv_edges(layer):
-                ps,sr = self._get_prefill_coord(src_npu)
+                ps, sr = self._get_prefill_coord(src_npu)
                 ds, dr = self._get_decode_coord(dst_npu)
-                name_kv= kv_name(src_stage=ps, dst_stage=ds, ssh=sr, dsh=dr, it=0, L=layer)
-                name_req = kvreq_name(src_stage=ps, dst_stage=ds, ssh=sr, dsh=dr, it=0, L=layer)
+                name_kv = kv_name(src_stage=ps, dst_stage=ds, ssh=sr, dsh=dr, it=0, L=layer)
                 ready_hook = kv_ready_hooks[(layer, src_npu)]
-                recv_node = self._create_kv_transfer_pair(nodes, src_npu, dst_npu, size, ready_hook, name_kv, name_req, is_pull_explicit)
+                recv_node = self._create_kv_transfer_pair(nodes, src_npu, dst_npu, size, ready_hook, name_kv)
                 self._stream_recv[(layer, dst_npu)].append(recv_node)
     
-    def _emit_bulk_transfer(self, nodes: Dict, last_node_per_npu: Dict, is_pull_explicit: bool) -> None:
+    def _emit_bulk_transfer(self, nodes: Dict, last_node_per_npu: Dict) -> None:
         """One SEND/RECV per (src,dst) pair carrying the whole KV (all owned layers), hung off the prefill tail of the source (DistServe approach)"""
         aggregated_bytes: Dict[Tuple[int,int], int] = defaultdict(int) # (src,dst) -> total bytes
         for layer in range(self.num_layers):
             for (src_npu, dst_npu, size) in self._kv_edges(layer):
                 aggregated_bytes[(src_npu, dst_npu)] += size
         for (src_npu, dst_npu), size in aggregated_bytes.items():
-            ps,sr = self._get_prefill_coord(src_npu)
+            ps, sr = self._get_prefill_coord(src_npu)
             ds, dr = self._get_decode_coord(dst_npu)
             name_kv = kv_name(src_stage=ps, dst_stage=ds, ssh=sr, dsh=dr, seg="all", it=0)
-            name_req = kvreq_name(src_stage=ps, dst_stage=ds, ssh=sr, dsh=dr, seg="all", it=0)
             ready_hook = last_node_per_npu[src_npu]
-            recv_node = self._create_kv_transfer_pair(nodes, src_npu, dst_npu, size, ready_hook, name_kv, name_req, is_pull_explicit)
+            recv_node = self._create_kv_transfer_pair(nodes, src_npu, dst_npu, size, ready_hook, name_kv)
             self._bulk_recv[dst_npu].append(recv_node)
 
-    def _create_kv_transfer_pair(self, nodes: Dict, src_npu: int, dst_npu: int, size: int, ready_hook: object, name_kv: str, name_req: str, is_pull_explicit: bool) -> object:
-        """Emit the send and receive nodes for a single KV transfer, with dependencies to ensure the send happens after `ready`. If `pull_explicit` is True, also emit a request SEND/RECV pair before the transfer."""
-        if is_pull_explicit:
-            #send request
-            req_send = send(
-                sender=dst_npu, receiver=src_npu, size=REQUEST_BYTES, 
-                parents=None,name=name_req, tag=comm_tag(name_req)
-            )
-            nodes[dst_npu].append(req_send)
-            req_recv = receive(
-                sender=dst_npu, receiver=src_npu, size=REQUEST_BYTES, 
-                parents=None, name=name_req, tag=comm_tag(name_req)
-            )
-            nodes[src_npu].append(req_recv)
-
-            #send KV cache after receiving the request and after the data is ready
-            kv_send = send(
-                sender=src_npu, receiver=dst_npu, size=size, 
-                parents=[ready_hook, req_recv], name=name_kv, tag=comm_tag(name_kv)
-            )
-            nodes[src_npu].append(kv_send)
-            kv_recv = receive(
-                sender=src_npu, receiver=dst_npu, size=size, 
-                parents=[req_send], name=name_kv, tag=comm_tag(name_kv)
-            )
-            nodes[dst_npu].append(kv_recv)
-        else:
-            #Pull or implicit push: prefill just sends as soon as ready, decode just receives without waiting for an explicit request
-            kv_send = send(
-                sender=src_npu, receiver=dst_npu, size=size, 
-                parents=[ready_hook], name=name_kv, tag=comm_tag(name_kv)
-            )
-            nodes[src_npu].append(kv_send)
-            kv_recv = receive(
-                sender=src_npu, receiver=dst_npu, size=size, 
-                parents=None, name=name_kv, tag=comm_tag(name_kv)
-            )
-            nodes[dst_npu].append(kv_recv)
-
+    def _create_kv_transfer_pair(self, nodes: Dict, src_npu: int, dst_npu: int, size: int, ready_hook: object, name_kv: str) -> object:
+        """Emit the SEND/RECV pair for a single KV transfer. The SEND is gated on
+        `ready_hook` so the cache is only pushed once prefill has produced it; the
+        RECV is dependency-free on the decode side and is consumed by the first
+        decode step that needs this layer's KV."""
+        kv_send = send(
+            sender=src_npu, receiver=dst_npu, size=size,
+            parents=[ready_hook], name=name_kv, tag=comm_tag(name_kv)
+        )
+        nodes[src_npu].append(kv_send)
+        kv_recv = receive(
+            sender=src_npu, receiver=dst_npu, size=size,
+            parents=None, name=name_kv, tag=comm_tag(name_kv)
+        )
+        nodes[dst_npu].append(kv_recv)
         return kv_recv
 
     def _get_kv_arrival_dependencies(self, layer: int, npu: int, local_idx: int) -> list:
         """KV nodes that the first decode step of `layer` on `npu` must wait for. 
         Streaming gates per layer; bulk gates the whole NPU on its first owned layer."""
-        if self.kv_cfg.mode == "streaming":
+        if self.kv_mode == "streaming":
             return list(self._stream_recv.get((layer, npu), []))
         if local_idx == 0:
             return list(self._bulk_recv.get(npu, []))

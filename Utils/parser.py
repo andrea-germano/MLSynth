@@ -58,19 +58,9 @@ class Request:
     gen_len: int
 
 @dataclass(frozen=True)
-class KVTransferConfig:
-    """Configuration for KV cache transfer between prefill and decode pools."""
-    mode: str
-    direction: str
-    explicit_request: bool = False  # if True, pull-based transfer requires an explicit request from the decode side
-
-    VALID_MODES={"bulk", "streaming"}
-    VALID_DIRECTIONS={"push", "pull"}
-
-@dataclass(frozen=True)
 class InferenceConfig:
     requests: List[Request]
-    kv_transfer: KVTransferConfig
+    kv_transfer: str #bulk or streaming
     serialize_decode_iterations: bool = True
 
 @dataclass(frozen=True)
@@ -154,7 +144,7 @@ def _build_parallelism(data: dict, model: ModelConfig) -> tuple[ParallelismConfi
 
 def _build_inference(data: dict, model: ModelConfig) -> InferenceConfig:
     requests = _build_requests(data, model)
-    kv_transfer = _build_kv_transfer(data.get("kv_transfer", {}))
+    kv_transfer = _build_kv_transfer(data.get("kv_transfer", "streaming"))
     serialize = bool(data.get("serialize_decode_iterations", True))
     return InferenceConfig(requests=requests, kv_transfer=kv_transfer, serialize_decode_iterations=serialize)
 
@@ -176,15 +166,14 @@ def _build_requests(data: dict, model: ModelConfig) -> List[Request]:
             raise ValueError(f"request[{i}]: prompt_len and gen_len must be >= 1.")
     return reqs
 
-def _build_kv_transfer(data: dict) -> KVTransferConfig:
-    mode = str(data.get("mode", "streaming")).lower()
-    direction = str(data.get("direction", "push")).lower()
-    explicit = bool(data.get("explicit_request", True))
-    if mode not in KVTransferConfig.VALID_MODES:
-        raise ValueError(f"kv_transfer.mode must be one of {KVTransferConfig.VALID_MODES}, got {mode!r}")
-    if direction not in KVTransferConfig.VALID_DIRECTIONS:
-        raise ValueError(f"kv_transfer.direction must be one of {KVTransferConfig.VALID_DIRECTIONS}, got {direction!r}")
-    return KVTransferConfig(mode=mode, direction=direction, explicit_request=explicit)
+def _build_kv_transfer(value) -> str:
+    VALID_KV_MODES = {"bulk", "streaming"}
+    if not isinstance(value, str):
+        raise ValueError(f"inference.kv_transfer must be a string, one of {sorted(VALID_KV_MODES)}")
+    mode = value.lower()
+    if mode not in VALID_KV_MODES:
+        raise ValueError(f"inference.kv_transfer must be one of {sorted(VALID_KV_MODES)}, got {mode!r}")
+    return mode
 
 def _require(data:dict, keys: tuple, ctx: str) -> None:
     missing = [k for k in keys if k not in data]
