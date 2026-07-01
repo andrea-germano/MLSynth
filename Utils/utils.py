@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from typing import List, Optional
+from Utils.naming import pg_for_name
 from chakra.schema.protobuf.et_def_pb2 import (
     Node as ChakraNode,
     NodeType as ChakraNodeType,
@@ -58,6 +59,7 @@ def send(sender, receiver, size, name="COMM_SEND_NODE", parents: Optional[List[C
     node.attr.append(ChakraAttr(name="comm_src", int32_val=sender))
     node.attr.append(ChakraAttr(name="comm_dst", int32_val=receiver))
     node.attr.append(ChakraAttr(name="comm_tag", int32_val=tag))
+    node.attr.append(ChakraAttr(name="comm_qos_pg", int32_val=pg_for_name(name)))
     if parents:
         for parent in parents:
             if parent:

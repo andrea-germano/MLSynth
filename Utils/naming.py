@@ -14,6 +14,19 @@ _ORDER = ("pl", # stands for pool --> prefill (p) or decode (d)
            )
 _TAG_MOD = 500_000_000  # ASTRA-sim NATIVE tag range (fits int32)
 
+_DEFAULT_PG = 3     # fallback for training edges
+_PG_BY_CLASS = {
+    # Highest priority to small numbers, available numbers are 1-7 (0 is reserved for ASTRA-sim internal use)
+    # Collective communication have priority = 3 
+    "KV": 4,      
+    "FIRSTTOK": 2,  # handoff first token (gating decode): high priority
+    "PP": 3,        # PP cross stage (gating next stage): medium priority
+    "DECFB": 2,     # feedback decode
+}
+
+def pg_for_name(name: str) -> int:
+    """Returns a deterministic priority group for a given node name"""
+    return _PG_BY_CLASS.get(name.split("_", 1)[0], _DEFAULT_PG)
 
 def _assemble(cls: str, fields: dict) -> str:
     pairs = "_".join(f"{k}={fields[k]}" for k in _ORDER if fields.get(k) is not None)

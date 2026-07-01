@@ -8,6 +8,7 @@ from chakra.src.third_party.utils.protolib import encodeMessage as encode_messag
 from Utils.parser import RunConfig
 from Model.TransformerInference import TransformerInference
 from Orchestrator.DisaggregatedInference import DisaggregatedInference
+from chakra.schema.protobuf.et_def_pb2 import COMM_SEND_NODE
 
 def write_comm_groups(comm_groups, path="") -> None:
     with open(os.path.join(path, "comm_groups.json"), "w") as f:
@@ -18,6 +19,30 @@ def write_nodes(nodes, name: str, path : str ="") -> None:
         with open(os.path.join(path, f"{name}.{npu_id}.et"), "wb") as et:
             for node in nodes[npu_id]:
                 encode_message(et, node)
+
+def _attr(node, attr_name):
+    for a in node.attr:
+        if a.name == attr_name:
+            return a
+    return None
+
+def assert_tag_uniqueness(nodes) -> None:
+    """Assert that all communication tags are unique across all nodes. This is important to avoid collisions in astra-sim"""
+    seen = {}  # (src, dst, tag) -> name
+    for npu_nodes in nodes.values():
+        for n in npu_nodes:
+            if n.type == COMM_SEND_NODE:
+                src = _attr(n, "comm_src").int32_val
+                dst = _attr(n, "comm_dst").int32_val
+                tag = _attr(n, "comm_tag").int32_val
+                key = (src, dst, tag)
+                if key in seen and seen[key] != n.name:
+                    raise ValueError(
+                        f"Collision tag on (src,dst)=({src},{dst}): "
+                        f"'{seen[key]}' vs '{n.name}' (tag={tag}). "
+                        f"This would break concurrent RECV matching in ASTRA-sim: disambiguate the names"
+                    )
+                seen[key] = n.name
 
 def main(argv = None) -> int:
     parser = argparse.ArgumentParser(description="Synthesize disaggregated inference workload")
@@ -42,6 +67,7 @@ def main(argv = None) -> int:
     write_comm_groups(comm_groups, path=str(out_dir))
 
     nodes = orch.exec()
+    assert_tag_uniqueness(nodes)
     write_nodes(nodes, run.model.name, path=str(et_dir))
 
     kv = run.inference.kv_transfer
