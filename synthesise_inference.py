@@ -8,7 +8,7 @@ from chakra.src.third_party.utils.protolib import encodeMessage as encode_messag
 from Utils.parser import RunConfig
 from Model.TransformerInference import TransformerInference
 from Orchestrator.DisaggregatedInference import DisaggregatedInference
-from chakra.schema.protobuf.et_def_pb2 import COMM_SEND_NODE
+from chakra.schema.protobuf.et_def_pb2 import COMM_SEND_NODE, Node as ChakraNode
 
 def write_comm_groups(comm_groups, path="") -> None:
     with open(os.path.join(path, "comm_groups.json"), "w") as f:
@@ -31,6 +31,8 @@ def assert_tag_uniqueness(nodes) -> None:
     seen = {}  # (src, dst, tag) -> name
     for npu_nodes in nodes.values():
         for n in npu_nodes:
+            if not isinstance(n, ChakraNode):
+                continue
             if n.type == COMM_SEND_NODE:
                 src = _attr(n, "comm_src").int32_val
                 dst = _attr(n, "comm_dst").int32_val
