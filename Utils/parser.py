@@ -124,7 +124,9 @@ def _build_parallelism(data: dict, model: ModelConfig) -> tuple[ParallelismConfi
         if model.hidden_size % tp != 0:
             raise ValueError(f"{label}: hidden_size ({model.hidden_size}) not divisible by tp_size ({tp}).")
         if model.num_kv_heads and max(tp, model.num_kv_heads) % min(tp, model.num_kv_heads) != 0:
-            raise ValueError(f"{label}: tp_size ({tp}) and num_kv_heads ({model.num_kv_heads}) must be multiples of each other (GQA).")        
+            raise ValueError(f"{label}: tp_size ({tp}) and num_kv_heads ({model.num_kv_heads}) must be multiples of each other (GQA).")
+        if model.num_kv_heads and tp > model.num_kv_heads:
+            raise ValueError(f"{label}: tp_size ({tp}) cannot exceed num_kv_heads in the current configuration ({model.num_kv_heads}).")   
         return ParallelismConfig(tp_size=tp, pp_size=pp)
 
     if "prefill_parallelism" in data or "decode_parallelism" in data:
