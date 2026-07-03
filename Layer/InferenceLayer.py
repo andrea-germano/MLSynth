@@ -20,7 +20,7 @@ class InferenceLayer(ABC):
     """
     
     @abstractmethod
-    def prefill(self, name: str, pg_name: str | None, prompt_lens: List[int]) -> LayerEmission:
+    def prefill(self, name: str, pg_name: str | None, prompt_lens: List[int], cached_lens: List[int]) -> LayerEmission:
         """Return Chakra nodes for the prefill phase of this layer."""
         raise NotImplementedError
     

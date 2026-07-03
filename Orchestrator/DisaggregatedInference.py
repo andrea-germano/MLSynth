@@ -57,14 +57,15 @@ class DisaggregatedInference(Orchestrator):
         #static request blob of token
         self.requests = run.inference.requests
         self.prompt_lens = [req.prompt_len for req in self.requests]
+        self.cached_lens = [req.cached_len for req in self.requests]
+        self.computed_tokens = sum(prompt_len - cached_len for prompt_len, cached_len in zip(self.prompt_lens, self.cached_lens))
         self.max_decode_steps = max(req.gen_len for req in self.requests)
-        self.total_prompt_tokens = sum(self.prompt_lens)
 
         self.kv_dim=run.model.key_value_dim # = hidden for MHA and kv_heads*head_dim for GQA
-        self.kv_bytes_per_layer = int(self.scale * 2 * self.kv_dim * self.bytes_per_val * self.total_prompt_tokens)
+        self.kv_bytes_per_layer = int(self.scale * 2 * self.kv_dim * self.bytes_per_val * self.computed_tokens)
 
         # PP aactivations transfer size
-        self.pp_prefill_bytes= int(self.scale * self.total_prompt_tokens * self.hidden_size * self.bytes_per_val)
+        self.pp_prefill_bytes= int(self.scale * self.computed_tokens * self.hidden_size * self.bytes_per_val)
 
         self._stream_recv: Dict[Tuple[int,int], List] = defaultdict(list) # (layer, dst) -> recvs
         self._bulk_recv: Dict[int, List] = defaultdict(list) # dst -> recvs

@@ -23,8 +23,8 @@ class TransformerInference(InferenceModel):
     def with_parallelism(self, parallelism: ParallelismConfig) -> "TransformerInference":
         return TransformerInference(self._model_cfg, parallelism)
 
-    def prefill(self, name: str, layer: int, prompt_lens: List[int], pg_name: str | None = None) -> LayerEmission:
-        return self._layer_for(layer).prefill(name=name, pg_name=pg_name, prompt_lens=prompt_lens)
+    def prefill(self, name: str, layer: int, prompt_lens: List[int], cached_lens: List[int], pg_name: str | None = None) -> LayerEmission:
+        return self._layer_for(layer).prefill(name=name, pg_name=pg_name, prompt_lens=prompt_lens, cached_lens=cached_lens)
 
     def decode(self, name: str, layer: int, kv_lens: List[int], pg_name: str | None = None) -> LayerEmission:
         return self._layer_for(layer).decode(name=name, pg_name=pg_name, kv_lens=kv_lens)

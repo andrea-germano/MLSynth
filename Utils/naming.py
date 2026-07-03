@@ -19,9 +19,9 @@ _PG_BY_CLASS = {
     # Highest priority to small numbers, available numbers are 1-7 (0 is reserved for ASTRA-sim internal use)
     # Collective communication have priority = 3 
     "KV": 4,      
-    "FIRSTTOK": 2,  # handoff first token (gating decode): high priority
+    "FIRSTTOK": 5,  # handoff first token (gating decode): high priority
     "PP": 3,        # PP cross stage (gating next stage): medium priority
-    "DECFB": 2,     # feedback decode
+    "DECFB": 5,     # feedback decode
 }
 
 def pg_for_name(name: str) -> int:

@@ -56,6 +56,7 @@ class Request:
     """A single inference request. `prompt_len` tokens are processed in prefill; `gen_len` tokens are produced autoregressively in decode."""
     prompt_len: int
     gen_len: int
+    cached_len: int = 0 # number of tokens already present in the KV cache (for resuming a previous request)
 
 @dataclass(frozen=True)
 class InferenceConfig:
@@ -80,7 +81,7 @@ class RunConfig:
         model = _build_model(data["model"])
 
         prefill, decode = _build_parallelism(data, model)
-        inference = _build_inference(data["inference"], model)
+        inference = _build_inference(data["inference"])
         return RunConfig(model=model, prefill=prefill, decode=decode, inference=inference)
        
 def _build_model(data: dict) -> ModelConfig:
@@ -144,29 +145,55 @@ def _build_parallelism(data: dict, model: ModelConfig) -> tuple[ParallelismConfi
         raise ValueError(f"KV resharding requires that one TP size is a multiple of the other, got prefill.tp_size={tp_p} and decode.tp_size={tp_d}")
     return prefill, decode
 
-def _build_inference(data: dict, model: ModelConfig) -> InferenceConfig:
-    requests = _build_requests(data, model)
+def _build_inference(data: dict) -> InferenceConfig:
+    requests = _build_requests(data)
     kv_transfer = _build_kv_transfer(data.get("kv_transfer", "streaming"))
     serialize = bool(data.get("serialize_decode_iterations", True))
     return InferenceConfig(requests=requests, kv_transfer=kv_transfer, serialize_decode_iterations=serialize)
 
-def _build_requests(data: dict, model: ModelConfig) -> List[Request]:
-    if "requests" in data:
-        reqs = [Request(prompt_len=int(r["prompt_len"]), gen_len=int(r["gen_len"])) for r in data["requests"]]
-    else:
-        # homogeneous shorthand
-        _require(data, ("num_requests", "prompt_len", "gen_len"), ctx="inference")
-        n = int(data["num_requests"])
-        p = int(data["prompt_len"])
-        g = int(data["gen_len"])
-        reqs = [Request(prompt_len=p, gen_len=g) for _ in range(n)]
+def _build_requests(data: dict) -> List[Request]:
+    has_explicit = "requests" in data
+    has_shortand = "num_requests" in data
+    if has_explicit and has_shortand:
+        raise ValueError("inference: specify either 'requests' or the shorthand 'num_requests', not both.")
+    if not has_explicit and not has_shortand:
+        raise ValueError("inference: either 'requests' or the shorthand 'num_requests' must be specified.")
+    if has_explicit:
+        entries = data["requests"]
+        if not entries:
+            raise ValueError("inference: 'requests' must contaain at least one entry")
+        return [_build_request(f"request[{i}]", entry) for i, entry in enumerate(entries)]
+    
+    _require(data, ("num_requests", "prompt_len", "gen_len"), ctx="inference")
+    n = int(data["num_requests"])
+    if n < 1:
+        raise ValueError("inference: num_requests must be >= 1")
+    template = _build_request("inference", data)
+    return [template for _ in range(n)]
 
-    if not reqs:
-        raise ValueError("inference: at least one request is required.")
-    for i, r in enumerate(reqs):
-        if r.prompt_len < 1 or r.gen_len < 1:
-            raise ValueError(f"request[{i}]: prompt_len and gen_len must be >= 1.")
-    return reqs
+def _build_request(ctx: str, data: dict) -> Request:
+    prompt_len = int(data["prompt_len"])
+    gen_len = int(data["gen_len"])
+    if prompt_len < 1 or gen_len < 1:
+        raise ValueError(f"{ctx}: prompt_len and gen_len must be >= 1")
+    cached_len = _resolve_cached_len(data, prompt_len, ctx)
+    return Request(prompt_len=prompt_len, gen_len=gen_len, cached_len=cached_len)
+
+def _resolve_cached_len(r:dict, prompt_len:int, ctx:str) -> int:
+    has_len = "cached_len" in r
+    has_frac = "cached_frac" in r
+    if has_len and has_frac:
+        raise ValueError(f"{ctx}: specify either cached_len or cached_frac, not both.")
+    if has_frac:
+        frac = float(r["cached_frac"])
+        if not (0 <= frac < 1):
+            raise ValueError(f"{ctx}: cached_frac must be in [0,1), got {frac}")
+        cached_len = int(frac * prompt_len)
+    else:
+        cached_len = int(r.get("cached_len", 0))
+    if not (0 <= cached_len < prompt_len):
+        raise ValueError(f"{ctx}: cached_len must be in [0, prompt_len), got {cached_len} for prompt_len={prompt_len}")
+    return cached_len
 
 def _build_kv_transfer(value) -> str:
     VALID_KV_MODES = {"bulk", "streaming"}

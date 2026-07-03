@@ -40,34 +40,38 @@ class TransformerInferenceLayer(InferenceLayer):
         self.ffn_weight_elems = num_ffn_matrices * hidden_size * self.ffn_intermediate_size
         self.ffn_flops_per_token = 2* num_ffn_matrices * hidden_size * self.ffn_intermediate_size
 
-    def prefill(self, name: str, pg_name: str | None, prompt_lens: List[int]) -> LayerEmission:
+    def prefill(self, name: str, pg_name: str | None, prompt_lens: List[int], cached_lens: List[int]) -> LayerEmission:
         b = self.bytes_per_val
 
-        total_prompt_tokens = sum(prompt_lens)
-        score_entries = sum(length * length for length in prompt_lens)   # Σ l²: coppie query–key
+        new_tokens = sum(prompt_len - cached_len for prompt_len, cached_len in zip(prompt_lens, cached_lens))
+        cached_tokens = sum(cached_lens)
+        #total_prompt_tokens = sum(prompt_lens)
+        # Query of the suffix still have to attend to the whole context (cached + new tokens)
+        score_entries = sum(length * length - cached_len * cached_len for length, cached_len in zip(prompt_lens, cached_lens))   #? Σ l²: coppie query–key, shouldn't be /2 for causal attention
 
         attn_flops = int(self.scale * (
-            2 * total_prompt_tokens * self.hidden_size * self.query_dim       # Q projection
-            + 4 * total_prompt_tokens * self.hidden_size * self.key_value_dim # K+V projections
-            + 2 * total_prompt_tokens * self.query_dim * self.hidden_size     # O projections
+            2 * new_tokens * self.hidden_size * self.query_dim       # Q projection
+            + 4 * new_tokens * self.hidden_size * self.key_value_dim # K+V projections
+            + 2 * new_tokens * self.query_dim * self.hidden_size     # O projections
             + 4 * score_entries * self.query_dim                         # QKᵀ + (scores · V)
         ) // self.tp_size)
 
         attn_bytes = int(self.scale * (
             self.attn_weight_elems * b // self.tp_size                 # Q,K,V,O weights (sharded)
-            + total_prompt_tokens * self.hidden_size * b               # input activations
-            + 2 * total_prompt_tokens * self.key_value_dim * b // self.tp_size  # KV written to cache
-            + total_prompt_tokens * self.hidden_size * b               # output activations
+            + new_tokens * self.hidden_size * b               # input activations
+            + 2 * new_tokens * self.key_value_dim * b // self.tp_size  # KV written to cache
+            + 2 * cached_tokens * self.key_value_dim * b // self.tp_size # KV cache already present read
+            + new_tokens * self.hidden_size * b               # output activations
         ))
 
-        ffn_flops = int(self.scale * (total_prompt_tokens * self.ffn_flops_per_token) // self.tp_size)
+        ffn_flops = int(self.scale * (new_tokens * self.ffn_flops_per_token) // self.tp_size)
         ffn_bytes = int(self.scale * (
             self.ffn_weight_elems * b // self.tp_size                  # FFN weights (sharded)
-            + 2 * total_prompt_tokens * self.hidden_size * b           # input + output activations
+            + 2 * new_tokens * self.hidden_size * b           # input + output activations
         ))
 
         return self._emit(name, pg_name, attn_flops, attn_bytes, ffn_flops, ffn_bytes,
-                          allreduce_tokens=total_prompt_tokens)
+                          allreduce_tokens=new_tokens)
 
     def decode(self, name: str, pg_name: str | None, kv_lens: List[int]) -> LayerEmission:
         b = self.bytes_per_val

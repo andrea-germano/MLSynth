@@ -11,7 +11,7 @@ class InferenceModel(ABC):
     than fwd/bckwd """
 
     @abstractmethod
-    def prefill(self, name: str, npu_id: int, layer: int, prompt_lens: List[int], pg_name: str | None = None) -> LayerEmission:
+    def prefill(self, name: str, npu_id: int, layer: int, prompt_lens: List[int], cached_lens: List[int], pg_name: str | None = None) -> LayerEmission:
         raise NotImplementedError
 
     @abstractmethod
