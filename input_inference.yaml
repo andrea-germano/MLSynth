@@ -26,11 +26,12 @@ inference:
   # The static "blob" of requests (no arrival times, no continuous batching).
   # Heterogeneous prompt / generation lengths are allowed.
   requests:
-    - { prompt_len: 16, gen_len: 4 }
-    - { prompt_len: 8,  gen_len: 6 }
-    - { prompt_len: 32, gen_len: 2 }
-  
+    - { prompt_len: 16, gen_len: 4, cached_len: 10 }
+    - { prompt_len: 8,  gen_len: 6, cached_frac: 0.5 }
+    - { prompt_len: 32, gen_len: 2, cached_frac: 0.625 }
+
   # Homogeneous shorthand (use instead of `requests`):
   # num_requests: 4
   # prompt_len: 16
   # gen_len: 4
+  # cached_len: 10
