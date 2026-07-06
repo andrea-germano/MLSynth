@@ -110,6 +110,8 @@ def _build_model(data: dict) -> ModelConfig:
         raise ValueError(f"bytes_per_val must be one of 1/2/4/8, got {cfg.bytes_per_val}")
     if cfg.num_attention_heads and cfg.num_kv_heads and cfg.num_attention_heads % cfg.num_kv_heads != 0:
         raise ValueError("num_attention_heads must be divisible by num_kv_heads (GQA).")
+    if (cfg.num_kv_heads or cfg.head_dim) and not cfg.num_attention_heads:
+        raise ValueError("num_kv_heads/head_dim require num_attention_heads to be set explicitly")
     return cfg
 
 def _build_parallelism(data: dict, model: ModelConfig) -> tuple[ParallelismConfig, ParallelismConfig]:

@@ -12,7 +12,6 @@ from Utils.naming import comp_name, coll_name
 
 #! It is supposed that a method like flash attention is used, since with a naive attention implementation the memory access for the attention scores would be much higher
 
-#! Forse possiamo omettere la lettura e la scrittura degli input e output activations, perchè spesso sono ottimizzati e non sono presenti
 class TransformerInferenceLayer(InferenceLayer):
     """ A single dense inference block, accounting for FLOPs and activations of a single transformer layer, for both prefill and decode phases
     Attention: MHA and GQA (via query_dim / key_value_dim)
@@ -47,7 +46,7 @@ class TransformerInferenceLayer(InferenceLayer):
         cached_tokens = sum(cached_lens)
         #total_prompt_tokens = sum(prompt_lens)
         # Query of the suffix still have to attend to the whole context (cached + new tokens)
-        score_entries = sum(length * length - cached_len * cached_len for length, cached_len in zip(prompt_lens, cached_lens))   #? Σ l²: coppie query–key, shouldn't be /2 for causal attention
+        score_entries = sum((prompt_len - cached_len) * prompt_len  for prompt_len, cached_len in zip(prompt_lens, cached_lens))   #? Σ l²: coppie query–key, shouldn't be /2 for causal attention
 
         attn_flops = int(self.scale * (
             2 * new_tokens * self.hidden_size * self.query_dim       # Q projection

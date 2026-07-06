@@ -42,9 +42,11 @@ class TransformerInference(InferenceModel):
 
     @property
     def num_params(self) -> float:
-        d, L = self._model_cfg.hidden_size, self._model_cfg.num_layers
-        V, S = self._model_cfg.vocab_size, self._model_cfg.sequence_len
-        return 12 * L * d * d * (1 + 13 / (12 * L * d) + (V + S) / (12 * L * d))
+        d, L, V = self._model_cfg.hidden_size, self._model_cfg.num_layers, self._model_cfg.vocab_size
+        per_layer= self._layer.attn_weight_elems + self._layer.ffn_weight_elems
+        embedding=2*V*d # embedding + lm head
+        norms = (2*L+1)*d
+        return float(L*per_layer + embedding + norms)
 
     def get_num_layers(self) -> int:
         return self._model_cfg.num_layers

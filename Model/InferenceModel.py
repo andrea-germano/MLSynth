@@ -11,11 +11,11 @@ class InferenceModel(ABC):
     than fwd/bckwd """
 
     @abstractmethod
-    def prefill(self, name: str, npu_id: int, layer: int, prompt_lens: List[int], cached_lens: List[int], pg_name: str | None = None) -> LayerEmission:
+    def prefill(self, name: str, layer: int, prompt_lens: List[int], cached_lens: List[int], pg_name: str | None = None) -> LayerEmission:
         raise NotImplementedError
 
     @abstractmethod
-    def decode(self, name: str, npu_id: int, layer: int, kv_lens: List[int], pg_name: str | None = None) -> LayerEmission:
+    def decode(self, name: str, layer: int, kv_lens: List[int], pg_name: str | None = None) -> LayerEmission:
         raise NotImplementedError
     
     @abstractmethod

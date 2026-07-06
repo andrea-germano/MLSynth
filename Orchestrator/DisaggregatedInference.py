@@ -180,7 +180,8 @@ class DisaggregatedInference(Orchestrator):
                     global_layer_idx = (stage*self.layer_per_stage_prefill) + local_layer_idx
                     emit_result = self.prefill_model.prefill(
                         name=comp_base(pl="p", ss=stage, sh=rank, L=global_layer_idx, it=0),
-                        layer=global_layer_idx, prompt_lens=self.prompt_lens, pg_name=process_group
+                        layer=global_layer_idx, prompt_lens=self.prompt_lens, cached_lens=self.cached_lens,
+                        pg_name=process_group
                     )
                     if last_node_per_npu[npu]:
                         add_dependencies(emit_result.nodes[0], [last_node_per_npu[npu]])
