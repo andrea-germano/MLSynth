@@ -14,25 +14,18 @@
 # limitations under the License.
 
 from abc import ABC, abstractmethod
-from typing import List
-from chakra.schema.protobuf.et_def_pb2 import (
-    Node as ChakraNode,
-)
 
 
-class Layer(ABC):
-    """Interface for a layer in a model.
-    
-    Layers implement the fundamental operations that occur at each
-    level of the model, specifically forward and backward computations.
-    """
-    
+class Orchestrator(ABC):
+    """Interface for an orchestrator that schedules a model over a set of NPUs and emits the
+    per-NPU Chakra node lists (both for training and inference)."""
+
     @abstractmethod
-    def fwd(self, name: str, pg_name: str | None = None, num_batches: int = 1) -> List[ChakraNode]:
-        """Execute forward computation for this layer and return nodes."""
+    def generate_comm_groups(self) -> dict:
+        """Return {pg_name: [npu_id, ...]} for every process group used by the emitted nodes."""
         raise NotImplementedError
-    
+
     @abstractmethod
-    def bckwd(self, name: str, pg_name: str | None = None, num_batches: int = 1) -> List[ChakraNode]:
-        """Execute backward computation for this layer and return nodes."""
+    def exec(self) -> dict:
+        """Return {npu_id: [GlobalMetadata, ChakraNode, ...]} for the whole run."""
         raise NotImplementedError

@@ -3,10 +3,10 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 from chakra.schema.protobuf.et_def_pb2 import GlobalMetadata
 
-from Utils.parser import RunConfig
-from Orchestrator.Orchestrator import Orchestrator
-from Model.InferenceModel import InferenceModel
-from Utils.utils import add_dependencies, send, receive
+from Utils.config import RunConfig
+from Orchestrator.Interfaces import Orchestrator
+from Model.Interfaces import BaseInferenceModel
+from Utils.nodes import add_dependencies, send, receive
 from Utils.naming import (comp_base, pp_name, kv_name, firsttok_name, decfb_name, comm_tag)
 
 # size of bytes of the sampled token feedback (used for serialization of decode iterations and for the first token handoff from prefill to decode)
@@ -16,12 +16,12 @@ SAMPLE_BYTES = 8
 class DisaggregatedInference(Orchestrator):
     """Separate pool for prefill and decode to model a disaggregated inference system where prefill and decode can be executed on different hardware.
     Each pool can have its own TP and PP topology. The KV cache is transferred with a streaming mechanism: each layer can send its KV cache to the decode pool
-    assynchronously as soon as it is produced in the prefil phase, overlapping comms with computation of next layer"""
+    asynchronously as soon as it is produced in the prefill phase, overlapping comms with computation of next layer"""
 
     #Prefill pool: NPU ids [0, num_prefill_npus),
     #Decode pool: NPU ids [num_prefill_npus, num_prefill_npus + num_decode_npus)
 
-    def __init__(self, model: InferenceModel, run: RunConfig):
+    def __init__(self, model: BaseInferenceModel, run: RunConfig):
         self.run = run
         self.model = model
 
@@ -64,7 +64,7 @@ class DisaggregatedInference(Orchestrator):
         self.kv_dim=run.model.key_value_dim # = hidden for MHA and kv_heads*head_dim for GQA
         self.kv_bytes_per_layer = int(self.scale * 2 * self.kv_dim * self.bytes_per_val * self.computed_tokens)
 
-        # PP aactivations transfer size
+        # PP activations transfer size
         self.pp_prefill_bytes= int(self.scale * self.computed_tokens * self.hidden_size * self.bytes_per_val)
 
         self._stream_recv: Dict[Tuple[int,int], List] = defaultdict(list) # (layer, dst) -> recvs
@@ -151,7 +151,7 @@ class DisaggregatedInference(Orchestrator):
         return edges
     
     # ------------------------------------------------------------------ #
-    # Firts phase: prefill
+    # First phase: prefill
     # ------------------------------------------------------------------ #
     def _emit_prefill(self, nodes: Dict, last_node_per_npu: Dict) -> Dict[Tuple[int,int], object]:
         """Emit the prefill pass, return the dict describing the kv_ready[(layer, src_npu)] nodes after which the KV cache of each layer is ready to be sent to the decode pool."""
@@ -180,7 +180,7 @@ class DisaggregatedInference(Orchestrator):
                     global_layer_idx = (stage*self.layer_per_stage_prefill) + local_layer_idx
                     emit_result = self.prefill_model.prefill(
                         name=comp_base(pl="p", ss=stage, sh=rank, L=global_layer_idx, it=0),
-                        layer=global_layer_idx, prompt_lens=self.prompt_lens, cached_lens=self.cached_lens,
+                        npu_id=npu, layer=global_layer_idx, prompt_lens=self.prompt_lens, cached_lens=self.cached_lens,
                         pg_name=process_group
                     )
                     if last_node_per_npu[npu]:
@@ -326,7 +326,7 @@ class DisaggregatedInference(Orchestrator):
                         global_layer_idx = stage*self.layer_per_stage_decode + local_layer_idx
                         emit_result = self.decode_model.decode(
                             name=comp_base(pl="d", ss=stage, sh=rank, L=global_layer_idx, it=step),
-                            layer=global_layer_idx, kv_lens=current_kv_lens, pg_name=process_group
+                            npu_id=npu, layer=global_layer_idx, kv_lens=current_kv_lens, pg_name=process_group
                         )
 
                         dependencies=[]
@@ -357,7 +357,7 @@ class DisaggregatedInference(Orchestrator):
                         nodes[npu].append(send_node)
                         last_node_per_npu[npu] = send_node
             
-            # Autoregressive serizialization
+            # Autoregressive serialization
             if step < self.max_decode_steps - 1:
                 self._emit_autoregressive_feedback(nodes, last_node_per_npu, step)
     

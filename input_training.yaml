@@ -1,0 +1,30 @@
+model:
+  name: "transformer"
+  num_layers: 24
+  hidden_size: 20480
+  vocab_size: 51200
+  bytes_per_val: 2
+  scale: 1
+  # Optional (same semantics as inference): num_attention_heads, num_kv_heads,
+  # head_dim, intermediate_size, ffn_type
+
+training:
+  batch_size: 32
+  sequence_len: 2048
+  num_microbatches: 8
+
+parallelism:
+  dp_size: 2
+  pp_size: 2
+  tp_size: 1
+
+wrapper:  # optional; the same block is also valid in input_inference.yaml
+  type: "compute"
+  seed: 42
+  conditions:
+    - npu_id: 0
+      pass: forward
+      slowdown: { type: constant, value: 0.1 }
+    - npu_id_range: [1, 2]
+      layer_id_range: [4, 5]
+      slowdown: { type: random, mean: 0.2, std: 0.1 }

@@ -41,18 +41,28 @@ def get_node(node_name: str, node_type: ChakraNodeType) -> ChakraNode:
     node.type = node_type
     return node
 
+def add_dependencies(child: ChakraNode, parents: Optional[List[Optional[ChakraNode]]]) -> None:
+    if parents:
+        for parent in parents:
+            if parent:
+                child.data_deps.append(parent.id)
+
+def attr_val(node: ChakraNode, attr_name: str):
+    """Return the value of a node attribute, reading the oneof member actually set."""
+    for a in node.attr:
+        if a.name == attr_name:
+            return getattr(a, a.WhichOneof("value"))
+    raise ValueError(f"Node {node.name!r} has no attribute {attr_name!r}")
+
 def compute(flops: int, tensor_size: int, parents: Optional[List[ChakraNode]] = None, name: str = "COMP_NODE") -> ChakraNode:
     node = get_node(name, COMP_NODE)
     node.attr.append(ChakraAttr(name="is_cpu_op", bool_val=False))
     node.attr.append(ChakraAttr(name="num_ops", int64_val=flops))
     node.attr.append(ChakraAttr(name="tensor_size", uint64_val=tensor_size))
-    if parents:
-        for parent in parents:
-            if parent:
-                node.data_deps.append(parent.id)
+    add_dependencies(node, parents)
     return node
 
-def send(sender, receiver, size, name="COMM_SEND_NODE", parents: Optional[List[ChakraNode]] = None, tag: int = 0):    
+def send(sender, receiver, size, name="COMM_SEND_NODE", parents: Optional[List[ChakraNode]] = None, tag: int = 0):
     node = get_node(name, COMM_SEND_NODE)
     node.attr.append(ChakraAttr(name="is_cpu_op", bool_val=False))
     node.attr.append(ChakraAttr(name="comm_size", int64_val=size))
@@ -60,39 +70,27 @@ def send(sender, receiver, size, name="COMM_SEND_NODE", parents: Optional[List[C
     node.attr.append(ChakraAttr(name="comm_dst", int32_val=receiver))
     node.attr.append(ChakraAttr(name="comm_tag", int32_val=tag))
     node.attr.append(ChakraAttr(name="comm_qos_pg", int32_val=pg_for_name(name)))
-    if parents:
-        for parent in parents:
-            if parent:
-                node.data_deps.append(parent.id)
+    add_dependencies(node, parents)
     return node
 
-def receive(sender, receiver, size, name="COMM_RECV_NODE", parents: Optional[List[ChakraNode]] = None, tag: int = 0):    
+def receive(sender, receiver, size, name="COMM_RECV_NODE", parents: Optional[List[ChakraNode]] = None, tag: int = 0):
     node = get_node(name, COMM_RECV_NODE)
     node.attr.append(ChakraAttr(name="is_cpu_op", bool_val=False))
     node.attr.append(ChakraAttr(name="comm_size", int64_val=size))
     node.attr.append(ChakraAttr(name="comm_src", int32_val=sender))
     node.attr.append(ChakraAttr(name="comm_dst", int32_val=receiver))
     node.attr.append(ChakraAttr(name="comm_tag", int32_val=tag))
-    if parents:
-        for parent in parents:
-            if parent:
-                node.data_deps.append(parent.id)
+    add_dependencies(node, parents)
     return node
 
 def allreduce(coll_size: int, pg_name: Optional[str] = None, name: str = "COMM_COLL_NODE_All-Reduce", parents: Optional[List[ChakraNode]] = None) -> ChakraNode:
-    # create Chakra Node    
     node = get_node(name, COMM_COLL_NODE)
-
-    # assign attributes
     node.attr.append(ChakraAttr(name="is_cpu_op", bool_val=False))
     node.attr.append(ChakraAttr(name="comm_type", int64_val=ALL_REDUCE))
     node.attr.append(ChakraAttr(name="comm_size", int64_val=coll_size))
     if pg_name:
         node.attr.append(ChakraAttr(name="pg_name", string_val=pg_name))
-    if parents:
-        for parent in parents:
-            if parent:
-                node.data_deps.append(parent.id)
+    add_dependencies(node, parents)
     return node
 
 def alltoall(coll_size: int, pg_name: Optional[str] = None, name: str = "COMM_COLL_NODE_All-To-All", parents: Optional[List[ChakraNode]] = None) -> ChakraNode:
@@ -102,14 +100,5 @@ def alltoall(coll_size: int, pg_name: Optional[str] = None, name: str = "COMM_CO
     node.attr.append(ChakraAttr(name="comm_size", int64_val=coll_size))
     if pg_name:
         node.attr.append(ChakraAttr(name="pg_name", string_val=pg_name))
-    if parents:
-        for parent in parents:
-            if parent:
-                node.data_deps.append(parent.id)
+    add_dependencies(node, parents)
     return node
-
-def add_dependencies(child: ChakraNode, parents: List[Optional[ChakraNode]]) -> None:
-    for parent in parents:
-        if parent:
-            child.data_deps.append(parent.id)
-    return

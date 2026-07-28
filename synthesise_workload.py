@@ -13,68 +13,99 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Single entry point for MLSynth: reads a YAML config and synthesises either a training
+workload (top-level `training` block) or a disaggregated-inference workload (top-level
+`inference` block)."""
+
+from __future__ import annotations
+import argparse
 import json
 import os
-import sys
 from pathlib import Path
-import argparse
 
-# Ensure local imports work without modifying system-wide settings
-#PROJECT_ROOT = Path(__file__).resolve().parents[1]
-#sys.path.insert(0, str(PROJECT_ROOT))
+from chakra.src.third_party.utils.protolib import encodeMessage as encode_message
+from chakra.schema.protobuf.et_def_pb2 import COMM_SEND_NODE, Node as ChakraNode
 
+from Utils.config import TrainRunConfig, load_config
+from Utils.nodes import attr_val
+from Model.TrainingModel import TrainingModel
+from Model.InferenceModel import InferenceModel
 from Wrapper.ComputeWrapper import ComputeWrapper
 from Orchestrator.MegatronLM import MegatronLM
-from Model.Transformer import Transformer
-from chakra.src.third_party.utils.protolib import encodeMessage as encode_message
-import yaml
+from Orchestrator.DisaggregatedInference import DisaggregatedInference
 
 
-def write_comm_groups(comm_groups, path=""):
-    with open(path + "comm_groups.json", "w") as f:
+def write_comm_groups(comm_groups, path: str | Path) -> None:
+    with open(os.path.join(path, "comm_groups.json"), "w") as f:
         json.dump(comm_groups, f, indent=2, sort_keys=True)
 
-def write_nodes(nodes, name, path=""):
+def write_nodes(nodes, name: str, path: str | Path) -> None:
     for npu_id in nodes.keys():
-        with open(path + f"{name}.{npu_id}.et", "wb") as et:
+        with open(os.path.join(path, f"{name}.{npu_id}.et"), "wb") as et:
             for node in nodes[npu_id]:
                 encode_message(et, node)
 
-def validate_config(cfg):
-    if cfg["model"]["batch_size"] < cfg["parallelism"]["dp_size"]:
-        raise ValueError(f"num batches (batch_size={cfg['model']['batch_size']}) must be greater than num dp groups (dp_size={cfg['parallelism']['dp_size']})!")
-    batch_size = cfg["model"]["batch_size"] // cfg["parallelism"]["dp_size"]
+def assert_tag_uniqueness(nodes) -> None:
+    """Assert that all communication tags are unique across all nodes. This is important to avoid collisions in astra-sim"""
+    seen = {}  # (src, dst, tag) -> name
+    for npu_nodes in nodes.values():
+        for n in npu_nodes:
+            if not isinstance(n, ChakraNode):
+                continue
+            if n.type == COMM_SEND_NODE:
+                src = attr_val(n, "comm_src")
+                dst = attr_val(n, "comm_dst")
+                tag = attr_val(n, "comm_tag")
+                key = (src, dst, tag)
+                if key in seen and seen[key] != n.name:
+                    raise ValueError(
+                        f"Collision tag on (src,dst)=({src},{dst}): "
+                        f"'{seen[key]}' vs '{n.name}' (tag={tag}). "
+                        f"This would break concurrent RECV matching in ASTRA-sim: disambiguate the names"
+                    )
+                seen[key] = n.name
 
-    if batch_size < cfg["model"]["num_microbatches"]:
-        raise ValueError(f"num batches (batch_size={cfg['model']['batch_size']}) must be greater than num microbatches (num_microbatches={cfg['model']['num_microbatches']})!")
 
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Synthesize workload from YAML config")
-    parser.add_argument("-c", "--config", default="input.yaml", help="Path to input YAML config file")
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Synthesize a training or inference workload from a YAML config")
+    parser.add_argument("-c", "--config", default="input.yaml",
+                        help="Path to the YAML config file (its `training`/`inference` block selects the mode)")
+    parser.add_argument("-o", "--out-dir", default="output",
+                        help="Base output directory (default: output)")
     args = parser.parse_args(argv)
 
-    with open(args.config, "r") as f:
-        cfg = yaml.safe_load(f)
+    run = load_config(args.config)
+    training = isinstance(run, TrainRunConfig)
 
-    validate_config(cfg)
+    if training:
+        m, p, t = run.model, run.parallelism, run.training
+        name = f"{m.name}_{p.dp_size}dp_{p.pp_size}pp_{p.tp_size}tp_{t.batch_size}B_{t.sequence_len}S_{m.vocab_size}V_{m.hidden_size}d_{m.bytes_per_val}b_{int(m.scale*100)}scale"
+        model = TrainingModel(run)
+    else:
+        name = run.model.name
+        # per-run auto-name, kept for reference:
+        # p, d = run.prefill, run.decode
+        # name = f"{run.model.name}_p{p.tp_size}tp{p.pp_size}pp_d{d.tp_size}tp{d.pp_size}pp_{len(run.inference.requests)}req_{run.inference.kv_transfer}"
+        # one shared model; the orchestrator derives prefill/decode views
+        model = InferenceModel(run.model, run.prefill)
 
-    name = f"{cfg['model']['name']}_{cfg['parallelism']['dp_size']}dp_{cfg['parallelism']['pp_size']}pp_{cfg['parallelism']['tp_size']}tp_{cfg['model']['batch_size']}B_{cfg['model']['sequence_len']}S_{cfg['model']['vocab_size']}V_{cfg['model']['hidden_size']}d_{cfg['model']['bytes_per_val']}b_{int(cfg['model']['scale']*100)}scale"
-    os.makedirs(f"output", exist_ok=True)
-    # make name directory
-    os.makedirs(f"output/{name}", exist_ok=True)
-    os.makedirs(f"output/{name}/et", exist_ok=True)
+    if run.wrapper:
+        model = ComputeWrapper(model, run.wrapper)
+    orchestrator = MegatronLM(model, run) if training else DisaggregatedInference(model, run)
 
-    model = Transformer(cfg)
-    if "wrapper" in cfg:
-        model = ComputeWrapper(model, cfg)
-    orchestrator = MegatronLM(model, cfg)
+    out_dir = Path(args.out_dir) / name
+    et_dir = out_dir / "et"
+    et_dir.mkdir(parents=True, exist_ok=True)
 
-    comm_groups = orchestrator.generate_comm_groups()
-    write_comm_groups(comm_groups, path=f"output/{name}/")
+    write_comm_groups(orchestrator.generate_comm_groups(), path=out_dir)
 
     nodes = orchestrator.exec()
-    write_nodes(nodes, name, path=f"output/{name}/et/")
+    if not training:
+        # inference traces carry per-name comm tags that must not collide; training uses default tags
+        assert_tag_uniqueness(nodes)
+    write_nodes(nodes, name, path=et_dir)
+
+    print(f"Wrote {'training' if training else 'inference'} ET for {len(nodes)} npus to {et_dir}")
     return 0
 
 

@@ -14,7 +14,8 @@ MLSynth is a tool to synthesise machine learning workloads to use in simulations
 Generate a Chakra execution trace from a YAML config:
 
 ```bash
-python .synthesise_workload.py
+python synthesise_workload.py -c input_training.yaml            # training (blocco `training` nello YAML)
+python synthesise_workload.py -c input_inference.yaml  # inference (blocco `inference` nello YAML)
 ```
 
 Outputs will be written under `output/<auto-name>/`.

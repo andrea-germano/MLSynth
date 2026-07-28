@@ -1,5 +1,4 @@
 .vscode
-output/
-output_inference/
+output*/
 __pycache__/
-test.yaml
+tests/

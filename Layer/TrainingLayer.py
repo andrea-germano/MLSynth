@@ -13,54 +13,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from Layer.Layer import Layer
-from Utils.utils import allreduce, compute
+from Layer.Interfaces import BaseTrainingLayer
+from Layer.DenseBlockMath import DenseBlockMath
+from Utils.config import ModelConfig
+from Utils.nodes import allreduce, compute
 from chakra.schema.protobuf.et_def_pb2 import (
     Node as ChakraNode,
 )
 
 
-class TransformerLayer(Layer):
-    """An implementation of a Transformer Layer."""
-    
-    def __init__(self, 
-        num_layers: int,
-        hidden_size: int,
-        sequence_len: int,
-        vocab_size: int,
-        tp_size: int,
-        bytes_per_val=2,
-        scale=1):
-        self.num_layers = num_layers
-        self.hidden_size = hidden_size
-        self.sequence_len = sequence_len
-        self.vocab_size = vocab_size
-        self.bytes_per_val = bytes_per_val
-        self.tp_size = tp_size
-        self.scale = scale
-    
-    def fwd(self, name="node_fwd", pg_name=None, num_batches=1) -> list[ChakraNode]:
-        tensor_size = int((12*self.hidden_size*self.hidden_size*self.bytes_per_val + num_batches*self.sequence_len*self.hidden_size*self.bytes_per_val) * self.scale)
+class TrainingLayer(BaseTrainingLayer):
+    """A single dense training block. The cost model lives in DenseBlockMath (shared with the
+    inference layer); the backward pass is modeled as 2x the forward FLOPs, emitted in reverse
+    order (FFN first, then attention). Attention scores are not halved for causal masking."""
 
-        # calculate flops for the attention block
-        attention_flops = int(self.scale * (8 * num_batches*self.sequence_len*self.hidden_size*self.hidden_size + 4*num_batches*self.sequence_len*self.sequence_len*self.hidden_size))
-        attention_compute = compute(attention_flops, tensor_size, name=f"{name}_attention_compute")
-        
+    def __init__(self, model_cfg: ModelConfig, sequence_len: int, tp_size: int):
+        self.math = DenseBlockMath.from_model_cfg(model_cfg, tp_size)
+        self.sequence_len = sequence_len
+        self.tp_size = tp_size
+
+    def _costs(self, num_batches):
+        tokens = num_batches * self.sequence_len
+        # every query attends to the full sequence (no /2 causal factor)
+        score_entries = num_batches * self.sequence_len * self.sequence_len
+        attn_flops, attn_bytes = self.math.attn_costs(
+            query_tokens=tokens, kv_read_tokens=0,
+            kv_write_tokens=tokens, score_entries=score_entries)
+        ffn_flops, ffn_bytes = self.math.ffn_costs(tokens)
+        return attn_flops, attn_bytes, ffn_flops, ffn_bytes, self.math.allreduce_bytes(tokens)
+
+    def fwd(self, name="node_fwd", pg_name=None, num_batches=1) -> list[ChakraNode]:
+        attn_flops, attn_bytes, ffn_flops, ffn_bytes, tp_comm_size = self._costs(num_batches)
+
+        attention_compute = compute(attn_flops, attn_bytes, name=f"{name}_attention_compute")
+
         # tensor parallel allreduce
         attention_allreduce = None
         if self.tp_size > 1:
-            tp_comm_size = int(self.scale * self.bytes_per_val * self.sequence_len * num_batches * self.hidden_size)
             attention_allreduce = allreduce(tp_comm_size, pg_name=pg_name, parents=[attention_compute], name=f"{name}_attention_allreduce")
-        
-        # calculate flops for the mlp block
-        ffwd_flops = int(self.scale * 16 * num_batches*self.sequence_len*self.hidden_size*self.hidden_size)
+
         ffwd_parent = [attention_allreduce] if attention_allreduce else [attention_compute]
-        ffwd_compute = compute(ffwd_flops, tensor_size, parents=ffwd_parent, name=f"{name}_ffwd_compute")        
-        
+        ffwd_compute = compute(ffn_flops, ffn_bytes, parents=ffwd_parent, name=f"{name}_ffwd_compute")
+
         # tensor parallel allreduce
         ffwd_allreduce = None
         if self.tp_size > 1:
-            tp_comm_size = int(self.scale * self.bytes_per_val * self.sequence_len * num_batches * self.hidden_size)
             ffwd_allreduce = allreduce(tp_comm_size, pg_name=pg_name, parents=[ffwd_compute], name=f"{name}_mlp_allreduce")
 
         nodes: list[ChakraNode] = [attention_compute]
@@ -73,27 +70,21 @@ class TransformerLayer(Layer):
 
 
     def bckwd(self, name="node_bckwd", pg_name=None, num_batches=1) -> list[ChakraNode]:
-        tensor_size = int((12*self.hidden_size*self.hidden_size*self.bytes_per_val + num_batches*self.sequence_len*self.hidden_size*self.bytes_per_val) * self.scale)
+        attn_flops, attn_bytes, ffn_flops, ffn_bytes, tp_comm_size = self._costs(num_batches)
 
-        # calculate flops for the mlp block
-        ffwd_flops = int(self.scale * 16 * num_batches*self.sequence_len*self.hidden_size*self.hidden_size)
-        ffwd_compute = compute(2 * ffwd_flops, tensor_size, name=f"{name}_ffwd_compute")
+        ffwd_compute = compute(2 * ffn_flops, ffn_bytes, name=f"{name}_ffwd_compute")
 
         # tensor parallel allreduce
         ffwd_allreduce = None
         if self.tp_size > 1:
-            tp_comm_size = int(self.scale * self.bytes_per_val * self.sequence_len * num_batches * self.hidden_size)
             ffwd_allreduce = allreduce(tp_comm_size, pg_name=pg_name, parents=[ffwd_compute], name=f"{name}_mlp_allreduce")
 
-        # calculate flops for the attention block
-        attention_flops = int(self.scale * (8 * num_batches*self.sequence_len*self.hidden_size*self.hidden_size + 4*num_batches*self.sequence_len*self.sequence_len*self.hidden_size))
         attention_parent = [ffwd_allreduce] if ffwd_allreduce else [ffwd_compute]
-        attention_compute = compute(2 * attention_flops, tensor_size=tensor_size, parents=attention_parent, name=f"{name}_attention_compute")
-        
+        attention_compute = compute(2 * attn_flops, tensor_size=attn_bytes, parents=attention_parent, name=f"{name}_attention_compute")
+
         # tensor parallel allreduce
         attention_allreduce = None
         if self.tp_size > 1:
-            tp_comm_size = int(self.scale * self.bytes_per_val * self.sequence_len * num_batches * self.hidden_size)
             attention_allreduce = allreduce(tp_comm_size, pg_name=pg_name, parents=[attention_compute], name=f"{name}_attention_allreduce")
 
         nodes: list[ChakraNode] = [ffwd_compute]

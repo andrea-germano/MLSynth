@@ -14,38 +14,45 @@
 # limitations under the License.
 
 from collections import defaultdict
-from Model.Model import Model
-from Orchestrator.Orchestrator import Orchestrator
-from Utils.utils import add_dependencies, allreduce, receive, send
+from Orchestrator.Interfaces import Orchestrator
+from Utils.config import TrainRunConfig
+from Utils.nodes import add_dependencies, allreduce, receive, send
 from chakra.schema.protobuf.et_def_pb2 import (
     GlobalMetadata,
 )
 
 
 class MegatronLM(Orchestrator):
-    def __init__(self, 
-        model: Model,
-        config):
+    """3D-parallel (DP x PP x TP) training orchestrator. `model` is a TrainingModel or a
+    Wrapper around one."""
+    def __init__(self,
+        model,
+        run: TrainRunConfig):
         self.model = model
-        self.dp_size = config["parallelism"]["dp_size"]
-        self.pp_size = config["parallelism"]["pp_size"]
-        self.tp_size = config["parallelism"]["tp_size"]
+        self.dp_size = run.parallelism.dp_size
+        self.pp_size = run.parallelism.pp_size
+        self.tp_size = run.parallelism.tp_size
         self.num_npus = self.dp_size * self.pp_size * self.tp_size
-        self.num_microbatches = config["model"]["num_microbatches"]
-        self.scale = config["model"]["scale"]
+        self.num_microbatches = run.training.num_microbatches
+        self.scale = run.model.scale
+
+    def _npu_id(self, dp_group: int, pp_stage: int, tp_shard: int) -> int:
+        return dp_group * (self.pp_size * self.tp_size) + (pp_stage * self.tp_size) + tp_shard
+
+    def _dp_pg_name(self, pp_stage: int, tp_shard: int) -> str:
+        # dp all-reduce group consists of all ranks that share the same pipeline stage and tensor parallel shard
+        pp_name = "" if self.pp_size <= 1 else f"pp_{pp_stage}"
+        tp_name = "" if self.tp_size <= 1 else f"_tp_{tp_shard}"
+        return f"{pp_name}{tp_name}"
 
     def generate_comm_groups(self):
         comm_groups = defaultdict(list)
 
-        # generate comm groups for data parallel groups        
+        # generate comm groups for data parallel groups
         for dp_group in range(self.dp_size):
             for pp_stage in range(self.pp_size):
                 for tp_shard in range(self.tp_size):
-                    # dp all-reduce group consists of all ranks that share the same pipeline stage and tensor parallel shard
-                    npu_id = dp_group * (self.pp_size * self.tp_size) + (pp_stage * self.tp_size) + tp_shard
-                    pp_name = "" if self.pp_size <= 1 else f"pp_{pp_stage}"
-                    tp_name = "" if self.tp_size <= 1 else f"_tp_{tp_shard}"
-                    comm_groups[f"{pp_name}{tp_name}"].append(npu_id)
+                    comm_groups[self._dp_pg_name(pp_stage, tp_shard)].append(self._npu_id(dp_group, pp_stage, tp_shard))
         
         # generate comm groups for each tensor parallel group
         if self.tp_size > 1:
@@ -79,7 +86,7 @@ class MegatronLM(Orchestrator):
             #print(f"------------ DP GROUP {dp_group} ------------")
             for pp_stage in range(self.pp_size):
                 for tp_shard in range(self.tp_size):
-                    npu_id = dp_group * (self.pp_size * self.tp_size) + (pp_stage * self.tp_size) + tp_shard
+                    npu_id = self._npu_id(dp_group, pp_stage, tp_shard)
                     tp_group = npu_id // self.tp_size
                     nodes[npu_id].append(GlobalMetadata(version="0.0.4"))
                     # print(f"NPU {npu_id} - dp group: {dp_group}, pp stage: {pp_stage}, tp shard: {tp_shard}")
@@ -141,8 +148,6 @@ class MegatronLM(Orchestrator):
                             nodes[npu_id].append(bck_snd_node)
 
                     if self.dp_size > 1:
-                        pp_name = "" if self.pp_size <= 1 else f"pp_{pp_stage}"
-                        tp_name = "" if self.tp_size <= 1 else f"_tp_{tp_shard}"
-                        dp_comm_node = allreduce(dp_comm_size, parents=[prev_comp], pg_name=f"{pp_name}{tp_name}", name=f"COMM_COLL_NODE_DP_All-Reduce_dp{dp_group}pp{pp_stage}tp{tp_shard}")
+                        dp_comm_node = allreduce(dp_comm_size, parents=[prev_comp], pg_name=self._dp_pg_name(pp_stage, tp_shard), name=f"COMM_COLL_NODE_DP_All-Reduce_dp{dp_group}pp{pp_stage}tp{tp_shard}")
                         nodes[npu_id].append(dp_comm_node)
         return nodes

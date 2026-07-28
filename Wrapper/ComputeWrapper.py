@@ -13,8 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from Wrapper.Wrapper import Wrapper
-from Utils.utils import compute
+from typing import List, Optional, Tuple
+
+from Wrapper.Interfaces import BaseWrapper
+from Layer.Interfaces import LayerEmission
+from Utils.config import ParallelismConfig, WrapperCondition, WrapperConfig
+from Utils.nodes import attr_val, compute
 from chakra.schema.protobuf.et_def_pb2 import (
     Node as ChakraNode,
     NodeType as ChakraNodeType,
@@ -23,90 +27,94 @@ from chakra.schema.protobuf.et_def_pb2 import (
 import numpy as np
 
 
-class ComputeWrapper(Wrapper):
-    """A wrapper that inserts compute slowdown nodes into the compute graph.
-       Currently incomplete."""
-    def __init__(self, model, config):
-        self.model = model
-        self.num_params = model.num_params
+class ComputeWrapper(BaseWrapper):
+    """A decorator that inserts compute slowdown nodes into the compute graph.
+    Works both in training (fwd/bckwd) and in inference (prefill/decode)."""
 
-        self.conditions = config["wrapper"]["conditions"]
-        # npu_id -> slowdown
-        #self.wrapped_npus = {}
-        # layer_id -> slowdown
-        #self.wrapped_layers = {}
+    def __init__(self, model, wrapper_cfg: WrapperConfig):
+        super().__init__(model)
+        self.wrapper_cfg = wrapper_cfg
+        self.rng = np.random.default_rng(wrapper_cfg.seed)
 
-        self.rng = np.random.default_rng(config["wrapper"]["seed"])
+    def with_parallelism(self, parallelism: ParallelismConfig) -> "ComputeWrapper":
+        # each derived view gets a fresh RNG seeded with the same seed: deterministic,
+        # but prefill/decode pools draw from independent identically-seeded streams
+        return ComputeWrapper(self.model.with_parallelism(parallelism), self.wrapper_cfg)
 
+    # ------------- training -------------
 
     def fwd(self, name, npu_id, layer, num_batches, pg_name=None) -> list[ChakraNode]:
         ops = self.model.fwd(name, npu_id, layer, num_batches, pg_name)
-        associated_slowdown_config = self.should_slowdown(npu_id, layer)
-        if associated_slowdown_config and ("pass" not in associated_slowdown_config or associated_slowdown_config["pass"] == "forward"):
-            ops = self.insert_slowdown(ops, associated_slowdown_config["slowdown"])
+        condition = self.should_slowdown(npu_id, layer)
+        if condition and condition.applies_to("forward"):
+            ops, _ = self._insert_slowdown(ops, self._slowdown_factor(condition))
         return ops
 
     def bckwd(self, name, npu_id, layer, num_batches, pg_name=None) -> list[ChakraNode]:
         ops = self.model.bckwd(name, npu_id, layer, num_batches, pg_name)
-        associated_slowdown_config = self.should_slowdown(npu_id, layer)
-        if associated_slowdown_config and ("pass" not in associated_slowdown_config or associated_slowdown_config["pass"] == "backward"):
-            ops = self.insert_slowdown(ops, associated_slowdown_config["slowdown"])
+        condition = self.should_slowdown(npu_id, layer)
+        if condition and condition.applies_to("backward"):
+            ops, _ = self._insert_slowdown(ops, self._slowdown_factor(condition))
         return ops
 
-    def should_slowdown(self, npu_id: int, layer: int) -> bool:
-        for condition in self.conditions:
-            npu_id_matches = True
-            layer_id_matches = True
-            if "npu_id" in condition and condition["npu_id"] != npu_id:
-                npu_id_matches = False
-            elif "npu_id_range" in condition and (npu_id < condition["npu_id_range"][0] or npu_id > condition["npu_id_range"][1]):
-                npu_id_matches = False
-            if "layer_id" in condition and condition["layer_id"] != layer:
-                layer_id_matches = False
-            elif "layer_id_range" in condition and (layer < condition["layer_id_range"][0] or layer > condition["layer_id_range"][1]):
-                layer_id_matches = False
-            if npu_id_matches and layer_id_matches:
+    # ------------- inference -------------
+
+    def prefill(self, name, npu_id, layer, prompt_lens, cached_lens, pg_name=None) -> LayerEmission:
+        emission = self.model.prefill(name, npu_id, layer, prompt_lens, cached_lens, pg_name)
+        condition = self.should_slowdown(npu_id, layer)
+        if condition and condition.applies_to("prefill"):
+            emission = self._apply_to_emission(emission, self._slowdown_factor(condition))
+        return emission
+
+    def decode(self, name, npu_id, layer, kv_lens, pg_name=None) -> LayerEmission:
+        emission = self.model.decode(name, npu_id, layer, kv_lens, pg_name)
+        condition = self.should_slowdown(npu_id, layer)
+        if condition and condition.applies_to("decode"):
+            emission = self._apply_to_emission(emission, self._slowdown_factor(condition))
+        return emission
+
+    # ------------- slowdown machinery -------------
+
+    def should_slowdown(self, npu_id: int, layer: int) -> Optional[WrapperCondition]:
+        for condition in self.wrapper_cfg.conditions:
+            if condition.matches(npu_id, layer):
                 return condition
         return None
 
-    def insert_slowdown(self, ops: list[ChakraNode], slowdown_config: dict) -> list[ChakraNode]:
-        if slowdown_config["type"] == "constant":
-            slowdown = slowdown_config["value"]
-        elif slowdown_config["type"] == "random":
-            slowdown = self.rng.normal(slowdown_config["mean"], slowdown_config["std"])
-        
+    def _slowdown_factor(self, condition: WrapperCondition) -> float:
+        spec = condition.slowdown
+        if spec.type == "constant":
+            return spec.value
+        return self.rng.normal(spec.mean, spec.std)
+
+    def _insert_slowdown(self, ops: List[ChakraNode], slowdown: float) -> Tuple[List[ChakraNode], dict]:
+        """Insert after every COMP_NODE a slowdown compute node scaled by `slowdown`.
+        Returns the updated list and a map {original comp node id -> slowdown node}."""
+        replaced: dict[int, ChakraNode] = {}
         if slowdown <= 0:
-            return ops
-        
+            return ops, replaced
+
         # Iterate in reverse order to avoid index issues when inserting elements
         for i in range(len(ops) - 1, -1, -1):
             op = ops[i]
             if op.type == ChakraNodeType.COMP_NODE:
-                compute_node = compute(int(op.attr[1].int64_val * slowdown), int(op.attr[2].int64_val * slowdown), parents=[op], name=f"{op.name}_slowdown")
-                # Only update dependencies if there's a next element
-                if i + 1 < len(ops):
+                slow_node = compute(int(attr_val(op, "num_ops") * slowdown),
+                                    int(attr_val(op, "tensor_size") * slowdown),
+                                    parents=[op], name=f"{op.name}_slowdown")
+                # Only update dependencies if there's a next element depending on op
+                if i + 1 < len(ops) and op.id in ops[i+1].data_deps:
                     ops[i+1].data_deps.remove(op.id)
-                    ops[i+1].data_deps.append(compute_node.id)
-                ops.insert(i+1, compute_node)
-        return ops
-    
-    def get_name(self) -> str:
-        return self.model.get_name()
-    
-    def get_num_params(self) -> int:
-        return self.model.get_num_params()
-    
-    def get_num_layers(self) -> int:
-        return self.model.get_num_layers()
+                    ops[i+1].data_deps.append(slow_node.id)
+                ops.insert(i+1, slow_node)
+                replaced[op.id] = slow_node
+        return ops, replaced
 
-    def get_hidden_size(self) -> int:
-        return self.model.get_hidden_size()
-
-    def get_sequence_len(self) -> int:
-        return self.model.get_sequence_len()
-
-    def get_batch_size(self) -> int:
-        return self.model.get_batch_size()
-
-    def get_bytes_per_val(self) -> int:
-        return self.model.get_bytes_per_val()
+    def _apply_to_emission(self, emission: LayerEmission, slowdown: float) -> LayerEmission:
+        """Apply the slowdown to a LayerEmission, retargeting tail/kv_ready when the node they
+        point to gained a trailing slowdown node (otherwise KV/PP sends would not wait for it)."""
+        nodes, replaced = self._insert_slowdown(list(emission.nodes), slowdown)
+        return LayerEmission(
+            nodes=nodes,
+            tail=replaced.get(emission.tail.id, emission.tail),
+            kv_ready=replaced.get(emission.kv_ready.id, emission.kv_ready),
+        )
