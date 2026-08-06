@@ -235,11 +235,10 @@ def _build_model(data: dict) -> ModelConfig:
         raise ValueError("num_kv_heads/head_dim require num_attention_heads to be set explicitly")
     return cfg
 
-def _build_moe(data: dict) -> MoeConfig | None:
+def _build_moe(data: dict | None) -> MoeConfig | None:
     if data is None:
         return None
     _require(data, ("num_experts",), ctx="model.moe")
-    routing = data.get("routing", {}) or {}
     cfg = MoeConfig(num_experts=int(data["num_experts"]), top_k=int(data.get("top_k", 1)))
     if cfg.num_experts < 2:
         raise ValueError("model.moe: num_experts must be >= 2 (a 1-expert MoE is a dense model)")
@@ -250,7 +249,7 @@ def _build_moe(data: dict) -> MoeConfig | None:
 def _build_moe_routing(data: dict | None, model: ModelConfig) -> MoeRoutingConfig | None:
     if model.moe is None:
         if data:
-            raise ValueError("moe_routing block is only meaningful for MoE models")
+            raise ValueError("moe_routing: present but the model has no model.moe block.")
         return None
     data = data or {}
     cfg = MoeRoutingConfig(
@@ -260,13 +259,13 @@ def _build_moe_routing(data: dict | None, model: ModelConfig) -> MoeRoutingConfi
         dispatch=str(data.get("dispatch", "p2p")).lower(),
     )
     if cfg.distribution not in ("dirichlet", "uniform"):
-        raise ValueError(f"moe_routing.distribution must be 'dirichlet' or 'uniform', got {cfg.distribution!r}")
+        raise ValueError(f"moe_routing: distribution must be dirichlet/uniform, got {cfg.distribution!r}")
     if cfg.alpha <= 0:
-        raise ValueError(f"moe_routing.alpha must be > 0, got {cfg.alpha}")
+        raise ValueError("moe_routing: alpha must be > 0")
     if cfg.dispatch not in ("p2p", "collective"):
-        raise ValueError(f"moe_routing.dispatch must be 'p2p' or 'collective', got {cfg.dispatch!r}")
+        raise ValueError(f"moe_routing: dispatch must be p2p/collective, got {cfg.dispatch!r}")
     if cfg.dispatch == "collective" and not cfg.is_uniform:
-        raise ValueError("moe_routing: collective dispatch requires uniform distribution")
+        raise ValueError("moe_routing: dispatch=collective requires distribution=uniform")
     return cfg
 
 def load_config(path: str | Path):
@@ -302,17 +301,33 @@ def _build_parallelism_block(block: dict, model: ModelConfig, label: str,
     tp = int(block.get("tp_size", 1))
     pp = int(block.get("pp_size", 1))
     dp = int(block.get("dp_size", 1))
+    ep = int(block.get("ep_size", 0))
     if dp < 1 or tp < 1 or pp < 1:
-        raise ValueError(f"{label}: all parallelism sizes must be >= 1.")
+        raise ValueError(f"{label}: tp_size/pp_size/dp_size must be >= 1.")
+    if ep and model.moe is None:
+        raise ValueError(f"{label}: ep_size requires a model.moe block.")
     if inference and dp != 1 and model.moe is None:
-        raise ValueError(f"{label}: dp_size > 1 is only meaningful for MoE models")
+        # vLLM applies the same rule: --data-parallel-* options are MoE-only, since dense DP replicas are fully independent
+        raise ValueError(f"{label}: dp_size > 1 is only meaningful for MoE models, where it shards "
+                         "requests and their KV cache across attention replicas and, together with "
+                         "tp, distributes the experts. For dense models run independent replicas.")
     _validate_model_parallelism(model, tp, pp, label)
-    cfg = ParallelismConfig(tp_size=tp, pp_size=pp, dp_size=dp)
+    cfg = ParallelismConfig(tp_size=tp, pp_size=pp, dp_size=dp, ep_size=ep)
     if model.moe is not None:
-        ep = cfg.ep_size(1 if inference else tp)
-        if model.moe.num_experts % ep != 0:
+        stage = cfg.npus_per_stage
+        if stage % cfg.ep:
+            raise ValueError(f"{label}: ep_size ({cfg.ep}) must divide tp_size*dp_size ({stage}).")
+        if model.moe.num_experts % cfg.ep:
             raise ValueError(f"{label}: num_experts ({model.moe.num_experts}) must be divisible by "
-                             f"the expert-parallel degree ep ({ep}).")
+                             f"ep ({cfg.ep}); experts are kept whole (etp=1).")
+        if cfg.ep > model.moe.num_experts:
+            raise ValueError(f"{label}: ep ({cfg.ep}) exceeds num_experts ({model.moe.num_experts}); "
+                             "an expert is never split (etp=1). Lower ep_size, or raise pp_size so "
+                             "that tp*dp per stage drops to the expert count.")
+        if inference and cfg.edp > 1:
+            raise ValueError(f"{label}: ep_size ({cfg.ep}) below tp_size*dp_size ({stage}) implies "
+                             f"edp={cfg.edp}, i.e. replicated experts. In inference that is EPLB-style "
+                             "redundancy, which is not modelled. Leave ep_size unset to derive tp*dp.")
     return cfg
 
 def _build_inference_parallelism(data: dict, model: ModelConfig) -> tuple[ParallelismConfig, ParallelismConfig]:

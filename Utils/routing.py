@@ -1,6 +1,6 @@
 from __future__ import annotations
 import numpy as np
-from Utils.config import MoeConfig
+from Utils.config import MoeConfig, MoeRoutingConfig
 
 PHASE_FWD, PHASE_PREFILL, PHASE_DECODE = 0, 1, 2
 _POP_NS = 9 
@@ -9,12 +9,13 @@ class RoutingPlan:
     """Pool-agnostic (NO ep_size in the constructor: prefill and decode share this object by
     identity but have different EP sizes; the group size is derived from len(origin_tokens))."""
 
-    def __init__(self, moe: MoeConfig):
+    def __init__(self, moe: MoeConfig, routing: MoeRoutingConfig):
         self.moe = moe
+        self.routing = routing
         self._cache: dict = {}
 
     def is_uniform(self) -> bool:
-        return self.moe.routing_distribution == "uniform"
+        return self.routing.distribution == "uniform"
 
     # Level 1: persistent per-layer expert popularity
     def popularity(self, layer: int) -> np.ndarray:
@@ -24,10 +25,10 @@ class RoutingPlan:
             The popular block rotates from layer to layer, so hotspots are temporally decorrelated
         """
         E = self.moe.num_experts
-        if self.moe.routing_distribution == "uniform":
+        if self.is_uniform():
             return np.full(E, 1.0 / E)
-        rng = np.random.default_rng([self.moe.routing_seed, _POP_NS, layer])
-        return rng.dirichlet(self.moe.routing_alpha * np.ones(E))
+        rng = np.random.default_rng([self.routing.seed, _POP_NS, layer])
+        return rng.dirichlet(self.routing.alpha * np.ones(E))
 
     # Level 2: per-key token draws (stochastic skew)
     def traffic_matrix(self, key: tuple, layer: int, origin_tokens: list[int]) -> np.ndarray:
@@ -41,7 +42,7 @@ class RoutingPlan:
 
         E, k = self.moe.num_experts, self.moe.top_k
         p = self.popularity(layer)
-        rng = np.random.default_rng([self.moe.routing_seed, *key])
+        rng = np.random.default_rng([self.routing.seed, *key])
 
         routed = np.zeros(E, dtype=np.int64)
         M = np.zeros((ep, ep), dtype=np.int64)
