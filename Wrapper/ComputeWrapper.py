@@ -43,15 +43,15 @@ class ComputeWrapper(BaseWrapper):
 
     # ------------- training -------------
 
-    def fwd(self, name, npu_id, layer, num_batches, pg_name=None) -> list[ChakraNode]:
-        ops = self.model.fwd(name, npu_id, layer, num_batches, pg_name)
+    def fwd(self, name, npu_id, layer, num_batches, pg_name=None, microbatch: int = 0, ep_ctx=None) -> list[ChakraNode]:
+        ops = self.model.fwd(name, npu_id, layer, num_batches, pg_name, microbatch=microbatch, ep_ctx=ep_ctx)
         condition = self.should_slowdown(npu_id, layer)
         if condition and condition.applies_to("forward"):
             ops, _ = self._insert_slowdown(ops, self._slowdown_factor(condition))
         return ops
 
-    def bckwd(self, name, npu_id, layer, num_batches, pg_name=None) -> list[ChakraNode]:
-        ops = self.model.bckwd(name, npu_id, layer, num_batches, pg_name)
+    def bckwd(self, name, npu_id, layer, num_batches, pg_name=None, microbatch: int = 0, ep_ctx=None) -> list[ChakraNode]:
+        ops = self.model.bckwd(name, npu_id, layer, num_batches, pg_name, microbatch=microbatch, ep_ctx=ep_ctx)
         condition = self.should_slowdown(npu_id, layer)
         if condition and condition.applies_to("backward"):
             ops, _ = self._insert_slowdown(ops, self._slowdown_factor(condition))
@@ -98,13 +98,16 @@ class ComputeWrapper(BaseWrapper):
         for i in range(len(ops) - 1, -1, -1):
             op = ops[i]
             if op.type == ChakraNodeType.COMP_NODE:
+                if attr_val(op, "num_ops") == 0 and attr_val(op, "tensor_size") == 0:
+                    continue  # zero-cost barrier nodes (MoE tails): a slowdown of 0 is pure noise
                 slow_node = compute(int(attr_val(op, "num_ops") * slowdown),
                                     int(attr_val(op, "tensor_size") * slowdown),
                                     parents=[op], name=f"{op.name}_slowdown")
-                # Only update dependencies if there's a next element depending on op
-                if i + 1 < len(ops) and op.id in ops[i+1].data_deps:
-                    ops[i+1].data_deps.remove(op.id)
-                    ops[i+1].data_deps.append(slow_node.id)
+                # Rewire EVERY dependent of op onto the slowdown node.
+                for j in range(i + 1, len(ops)):
+                    if op.id in ops[j].data_deps:
+                        ops[j].data_deps.remove(op.id)
+                        ops[j].data_deps.append(slow_node.id)
                 ops.insert(i+1, slow_node)
                 replaced[op.id] = slow_node
         return ops, replaced

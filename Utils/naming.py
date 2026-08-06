@@ -7,6 +7,8 @@ _ORDER = ("pl", # stands for pool --> prefill (p) or decode (d)
            "sh", # stands for tp shard id
            "ssh", # stands for src tp shard id (for kv, where src and dst differ)
            "dsh", # stands for dst tp shard id (for kv, where src and dst differ)
+           "se", #stands for source expert id (for kv, where src and dst differ)
+           "de", #stands for destination expert id (for kv, where src and dst differ)
            "L", # stands for layer
            "seg", # stands for range of layers
            "op", # operation performed: attn/ffw/ecc
@@ -22,6 +24,7 @@ _PG_BY_CLASS = {
     "FIRSTTOK": 5,  # handoff first token (gating decode): high priority
     "PP": 3,        # PP cross stage (gating next stage): medium priority
     "DECFB": 5,     # feedback decode
+    "A2A": 3,        # all-to-all (MoE): medium priority
 }
 
 def pg_for_name(name: str) -> int:
@@ -52,12 +55,16 @@ def coll_name(base: str, op: str) -> str:
 def pp_name(*, pl, src_stage, dst_stage, sh, it) -> str:
     return _assemble("PP", dict(pl=pl, ss=src_stage, ds=dst_stage, sh=sh, it=it))
 
-def kv_name(*, src_stage, dst_stage, ssh, dsh, it, L=None, seg=None) -> str:
-    return _assemble("KV", dict(ss=src_stage, ds=dst_stage, ssh=ssh, dsh=dsh, L=L, seg=seg, it=it))
+def kv_name(*, src_stage, dst_stage, ssh, dsh, it, L=None, seg=None, se=None, de=None) -> str:
+    return _assemble("KV", dict(ss=src_stage, ds=dst_stage, ssh=ssh, dsh=dsh, se=se, de=de, L=L, seg=seg, it=it))
 
-def firsttok_name(*, src_stage, dst_stage, dsh, it) -> str:
-    return _assemble("FIRSTTOK", dict(ss=src_stage, ds=dst_stage, dsh=dsh, it=it))
+def firsttok_name(*, src_stage, dst_stage, dsh, it, se=None, de=None) -> str:
+    return _assemble("FIRSTTOK", dict(ss=src_stage, ds=dst_stage, dsh=dsh, se=se, de=de, it=it))
 
 def decfb_name(*, pl, src_stage, dst_stage, sh, it) -> str:
     # Decode feedback edge. Similar to pp edge but goes back from dst_stage to src_stage, and carries the token just produced at dst_stage back to src_stage for the next decode iteration.
     return _assemble("DECFB", dict(pl=pl, ss=src_stage, ds=dst_stage, sh=sh, it=it))
+
+def a2a_name(*, pl, op, stage, se, de, L, it, sh=None) -> str:
+    """MoE dispatch/combine edge. op in {"disp", "comb"}"""
+    return _assemble("A2A", dict(pl=pl, ss=stage, sh=sh, se=se, de=de, L=L, op=op, it=it))

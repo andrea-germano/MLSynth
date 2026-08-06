@@ -14,6 +14,7 @@ class ModelConfig:
     vocab_size: int
     bytes_per_val: int = 2
     scale: float = 1.0
+    moe: MoeConfig | None = None
     
     num_attention_heads: int = 0 #default is q_dim/kv_dim = hidden_size
     num_kv_heads: int = 0 #set to num_attention heads for MHA, otherwise it's GQA
@@ -40,15 +41,54 @@ class ModelConfig:
     def ffn_intermediate_size(self) -> int:
         return self.intermediate_size or 4 * self.hidden_size
 
+@dataclass(frozen=True)
+class MoeConfig:
+    """Mixture-of-experts configuration for training and inference"""
+    num_experts: int
+    top_k: int = 1 #dispatch volume per token, default is 1
+
+@dataclass(frozen=True)
+class MoeRoutingConfig:
+    """How the synthesizer stands in for a learned router. These are assumptions, not
+    properties of any real system: the router is data-dependent and a static trace cannot be
+    reactive, so routing is realised by sampling at synthesis time with a dedicated seed"""
+    distribution: str = "dirichlet"   # dirichlet | uniform
+    alpha: float = 1.0  # dirichlet concentration; small = skewed
+    seed: int = 0 
+    dispatch: str = "p2p" # p2p | collective (means a native all to all communication, collective requires uniform)
+
+    @property
+    def is_uniform(self) -> bool:
+        return self.distribution == "uniform"
+
 @dataclass(frozen=True) 
 class ParallelismConfig:
-    """Tensor- and pipeline-parallel degrees for one pool. No DP in inference (it would only replicate the model)."""
+    """Tensor-, pipeline- and data-parallel degrees. Shared by training and inference
+     Expert mesh: etp * ep == tp * dp, i.e. ep = tp*dp // etp, with
+      - training  (Megatron-Core defaults, "ETP mode"): etp = tp  =>  ep = dp
+      - inference (vLLM serving, "EP mode"):  etp = 1   =>  ep = tp*dp
+    so `ep` is never a free knob and is never configured
+    DP in inference is only meaningful for MoE models, for dense models it would only produce independent replicas with identical traces, so it is rejected there"""
     tp_size: int = 1
     pp_size: int = 1
+    dp_size: int = 1
+    ep_size: int = 0 #0= default, derive as tp*dp
 
     @property
     def num_npus(self) -> int:
-        return self.pp_size * self.tp_size
+        return self.pp_size * self.tp_size * self.dp_size
+
+    @property
+    def npus_per_stage(self) -> int:
+        return self.tp_size * self.dp_size
+
+    @property
+    def ep(self)-> int:
+        return self.ep_size or self.npus_per_stage
+
+    @property
+    def edp(self) -> int:
+        return self.npus_per_stage // self.ep
 
 @dataclass(frozen=True)
 class Request:
@@ -69,17 +109,6 @@ class TrainingConfig:
     batch_size: int
     sequence_len: int
     num_microbatches: int
-
-@dataclass(frozen=True)
-class TrainParallelismConfig:
-    """Data-, pipeline- and tensor-parallel degrees for training."""
-    dp_size: int = 1
-    pp_size: int = 1
-    tp_size: int = 1
-
-    @property
-    def num_npus(self) -> int:
-        return self.dp_size * self.pp_size * self.tp_size
 
 @dataclass(frozen=True)
 class SlowdownSpec:
@@ -125,35 +154,39 @@ class WrapperConfig:
     type: str = "compute"
 
 @dataclass(frozen=True)
-class RunConfig:
+class InferenceRunConfig:
     model: ModelConfig
     prefill: ParallelismConfig
     decode: ParallelismConfig
     inference: InferenceConfig
     wrapper: WrapperConfig | None = None
+    moe_routing: MoeRoutingConfig | None = None
 
     @staticmethod
-    def from_yaml(path: str | Path) -> RunConfig:
+    def from_yaml(path: str | Path) -> InferenceRunConfig:
         with open(path, "r") as f:
-            return RunConfig.from_data(yaml.safe_load(f))
+            return InferenceRunConfig.from_data(yaml.safe_load(f))
 
     @staticmethod
-    def from_data(data: dict) -> RunConfig:
+    def from_data(data: dict) -> InferenceRunConfig:
         _require(data, ("model", "inference"), ctx="root")
 
         model = _build_model(data["model"])
-
-        prefill, decode = _build_parallelism(data, model)
+        routing = _build_moe_routing(data.get("moe_routing"), model)
+        if routing is not None and routing.dispatch == "collective":
+            raise ValueError("Inference does not support collective all-to-all dispatch, only p2p")
+        prefill, decode = _build_inference_parallelism(data, model)
         inference = _build_inference(data["inference"])
         wrapper = _build_wrapper(data.get("wrapper"))
-        return RunConfig(model=model, prefill=prefill, decode=decode, inference=inference, wrapper=wrapper)
+        return InferenceRunConfig(model=model, prefill=prefill, decode=decode, inference=inference, wrapper=wrapper, moe_routing=routing)
 
 @dataclass(frozen=True)
 class TrainRunConfig:
     model: ModelConfig
-    parallelism: TrainParallelismConfig
+    parallelism: ParallelismConfig
     training: TrainingConfig
     wrapper: WrapperConfig | None = None
+    moe_routing: MoeRoutingConfig | None = None
 
     @staticmethod
     def from_yaml(path: str | Path) -> TrainRunConfig:
@@ -165,11 +198,12 @@ class TrainRunConfig:
         _require(data, ("model", "training", "parallelism"), ctx="root")
 
         model = _build_model(data["model"])
-        parallelism = _build_train_parallelism(data["parallelism"], model)
+        routing = _build_moe_routing(data.get("moe_routing"), model)
+        parallelism = _build_parallelism_block(data["parallelism"], model, "parallelism", inference=False)
         training = _build_training(data["training"], parallelism)
         wrapper = _build_wrapper(data.get("wrapper"))
-        return TrainRunConfig(model=model, parallelism=parallelism, training=training, wrapper=wrapper)
-       
+        return TrainRunConfig(model=model, parallelism=parallelism, training=training, wrapper=wrapper, moe_routing=routing)
+
 def _build_model(data: dict) -> ModelConfig:
     _require(data, ("name", "num_layers", "hidden_size", "vocab_size", "bytes_per_val"), ctx="model")
 
@@ -184,6 +218,7 @@ def _build_model(data: dict) -> ModelConfig:
         vocab_size=int(data["vocab_size"]),
         bytes_per_val=int(data["bytes_per_val"]),
         scale=float(data.get("scale", 1.0)),
+        moe=_build_moe(data.get("moe")),
         num_attention_heads=int(data.get("num_attention_heads", 0)),
         num_kv_heads=int(data.get("num_kv_heads", 0)),
         head_dim=int(data.get("head_dim", 0)),
@@ -200,6 +235,40 @@ def _build_model(data: dict) -> ModelConfig:
         raise ValueError("num_kv_heads/head_dim require num_attention_heads to be set explicitly")
     return cfg
 
+def _build_moe(data: dict) -> MoeConfig | None:
+    if data is None:
+        return None
+    _require(data, ("num_experts",), ctx="model.moe")
+    routing = data.get("routing", {}) or {}
+    cfg = MoeConfig(num_experts=int(data["num_experts"]), top_k=int(data.get("top_k", 1)))
+    if cfg.num_experts < 2:
+        raise ValueError("model.moe: num_experts must be >= 2 (a 1-expert MoE is a dense model)")
+    if not (1 <= cfg.top_k <= cfg.num_experts):
+        raise ValueError(f"model.moe: top_k must be in [1, num_experts], got {cfg.top_k}")
+    return cfg
+
+def _build_moe_routing(data: dict | None, model: ModelConfig) -> MoeRoutingConfig | None:
+    if model.moe is None:
+        if data:
+            raise ValueError("moe_routing block is only meaningful for MoE models")
+        return None
+    data = data or {}
+    cfg = MoeRoutingConfig(
+        distribution=str(data.get("distribution", "dirichlet")).lower(),
+        alpha=float(data.get("alpha", 1.0)),
+        seed=int(data.get("seed", 0)),
+        dispatch=str(data.get("dispatch", "p2p")).lower(),
+    )
+    if cfg.distribution not in ("dirichlet", "uniform"):
+        raise ValueError(f"moe_routing.distribution must be 'dirichlet' or 'uniform', got {cfg.distribution!r}")
+    if cfg.alpha <= 0:
+        raise ValueError(f"moe_routing.alpha must be > 0, got {cfg.alpha}")
+    if cfg.dispatch not in ("p2p", "collective"):
+        raise ValueError(f"moe_routing.dispatch must be 'p2p' or 'collective', got {cfg.dispatch!r}")
+    if cfg.dispatch == "collective" and not cfg.is_uniform:
+        raise ValueError("moe_routing: collective dispatch requires uniform distribution")
+    return cfg
+
 def load_config(path: str | Path):
     """Load a YAML config and dispatch on its mode: a top-level `inference` block yields a
     RunConfig, a top-level `training` block yields a TrainRunConfig."""
@@ -210,7 +279,7 @@ def load_config(path: str | Path):
     if has_inference and has_training:
         raise ValueError("Config must contain either an 'inference' or a 'training' block, not both.")
     if has_inference:
-        return RunConfig.from_data(data)
+        return InferenceRunConfig.from_data(data)
     if has_training:
         return TrainRunConfig.from_data(data)
     raise ValueError("Config must contain either an 'inference' or a 'training' block.")
@@ -227,14 +296,28 @@ def _validate_model_parallelism(model: ModelConfig, tp: int, pp: int, label: str
     if model.num_kv_heads and tp > model.num_kv_heads:
         raise ValueError(f"{label}: tp_size ({tp}) cannot exceed num_kv_heads in the current configuration ({model.num_kv_heads}).")
 
-def _build_parallelism(data: dict, model: ModelConfig) -> tuple[ParallelismConfig, ParallelismConfig]:
+def _build_parallelism_block(block: dict, model: ModelConfig, label: str,
+                             *, inference: bool) -> ParallelismConfig:
+    """Parse and validate one parallelism block (inference validates two: prefill and decode)"""
+    tp = int(block.get("tp_size", 1))
+    pp = int(block.get("pp_size", 1))
+    dp = int(block.get("dp_size", 1))
+    if dp < 1 or tp < 1 or pp < 1:
+        raise ValueError(f"{label}: all parallelism sizes must be >= 1.")
+    if inference and dp != 1 and model.moe is None:
+        raise ValueError(f"{label}: dp_size > 1 is only meaningful for MoE models")
+    _validate_model_parallelism(model, tp, pp, label)
+    cfg = ParallelismConfig(tp_size=tp, pp_size=pp, dp_size=dp)
+    if model.moe is not None:
+        ep = cfg.ep_size(1 if inference else tp)
+        if model.moe.num_experts % ep != 0:
+            raise ValueError(f"{label}: num_experts ({model.moe.num_experts}) must be divisible by "
+                             f"the expert-parallel degree ep ({ep}).")
+    return cfg
+
+def _build_inference_parallelism(data: dict, model: ModelConfig) -> tuple[ParallelismConfig, ParallelismConfig]:
     def one(block: dict, label: str) -> ParallelismConfig:
-        tp = int(block.get("tp_size", 1))
-        pp = int(block.get("pp_size", 1))
-        if int(block.get("dp_size", 1)) != 1:
-            raise ValueError("DP is not supported in inference (it only replicates the model).")
-        _validate_model_parallelism(model, tp, pp, label)
-        return ParallelismConfig(tp_size=tp, pp_size=pp)
+        return _build_parallelism_block(block, model, label, inference=True)
 
     if "prefill_parallelism" in data or "decode_parallelism" in data:
         _require(data, ("prefill_parallelism", "decode_parallelism"), ctx="root")
@@ -301,16 +384,7 @@ def _resolve_cached_len(r: dict, prompt_len: int, ctx: str) -> int:
         raise ValueError(f"{ctx}: cached_len must be in [0, prompt_len), got {cached_len} for prompt_len={prompt_len}")
     return cached_len
 
-def _build_train_parallelism(block: dict, model: ModelConfig) -> TrainParallelismConfig:
-    dp = int(block.get("dp_size", 1))
-    pp = int(block.get("pp_size", 1))
-    tp = int(block.get("tp_size", 1))
-    if dp < 1:
-        raise ValueError("parallelism: dp_size must be >= 1.")
-    _validate_model_parallelism(model, tp, pp, "parallelism")
-    return TrainParallelismConfig(dp_size=dp, pp_size=pp, tp_size=tp)
-
-def _build_training(data: dict, parallelism: TrainParallelismConfig) -> TrainingConfig:
+def _build_training(data: dict, parallelism: ParallelismConfig) -> TrainingConfig:
     _require(data, ("batch_size", "sequence_len", "num_microbatches"), ctx="training")
     cfg = TrainingConfig(
         batch_size=int(data["batch_size"]),
