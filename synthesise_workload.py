@@ -30,6 +30,8 @@ from Utils.config import TrainRunConfig, load_config
 from Utils.nodes import attr_val
 from Model.TrainingModel import TrainingModel
 from Model.InferenceModel import InferenceModel
+from Model.MoeTrainingModel import MoeTrainingModel
+from Model.MoeInferenceModel import MoeInferenceModel
 from Wrapper.ComputeWrapper import ComputeWrapper
 from Orchestrator.MegatronLM import MegatronLM
 from Orchestrator.DisaggregatedInference import DisaggregatedInference
@@ -46,7 +48,8 @@ def write_nodes(nodes, name: str, path: str | Path) -> None:
                 encode_message(et, node)
 
 def assert_tag_uniqueness(nodes) -> None:
-    """Assert that all communication tags are unique across all nodes. This is important to avoid collisions in astra-sim"""
+    """Assert that all communication tags are unique across all nodes. This is important to avoid collisions in astra-sim.
+    Legacy training PP/DP edges carry tag 0 and are matched by emission order, so they are skipped."""
     seen = {}  # (src, dst, tag) -> name
     for npu_nodes in nodes.values():
         for n in npu_nodes:
@@ -56,6 +59,8 @@ def assert_tag_uniqueness(nodes) -> None:
                 src = attr_val(n, "comm_src")
                 dst = attr_val(n, "comm_dst")
                 tag = attr_val(n, "comm_tag")
+                if tag == 0:
+                    continue
                 key = (src, dst, tag)
                 if key in seen and seen[key] != n.name:
                     raise ValueError(
@@ -77,17 +82,21 @@ def main(argv=None) -> int:
     run = load_config(args.config)
     training = isinstance(run, TrainRunConfig)
 
+    moe = run.model.moe is not None
     if training:
         m, p, t = run.model, run.parallelism, run.training
         name = f"{m.name}_{p.dp_size}dp_{p.pp_size}pp_{p.tp_size}tp_{t.batch_size}B_{t.sequence_len}S_{m.vocab_size}V_{m.hidden_size}d_{m.bytes_per_val}b_{int(m.scale*100)}scale"
-        model = TrainingModel(run)
+        if moe:
+            name += f"_{p.ep}ep_{m.moe.num_experts}E"
+        model = MoeTrainingModel(run) if moe else TrainingModel(run)
     else:
         name = run.model.name
         # per-run auto-name, kept for reference:
         # p, d = run.prefill, run.decode
         # name = f"{run.model.name}_p{p.tp_size}tp{p.pp_size}pp_d{d.tp_size}tp{d.pp_size}pp_{len(run.inference.requests)}req_{run.inference.kv_transfer}"
         # one shared model; the orchestrator derives prefill/decode views
-        model = InferenceModel(run.model, run.prefill)
+        model = (MoeInferenceModel(run.model, run.moe_routing, run.prefill) if moe
+                 else InferenceModel(run.model, run.prefill))
 
     if run.wrapper:
         model = ComputeWrapper(model, run.wrapper)
@@ -100,9 +109,9 @@ def main(argv=None) -> int:
     write_comm_groups(orchestrator.generate_comm_groups(), path=out_dir)
 
     nodes = orchestrator.exec()
-    if not training:
-        # inference traces carry per-name comm tags that must not collide; training uses default tags
-        assert_tag_uniqueness(nodes)
+    # inference and MoE traces carry per-name comm tags that must not collide; legacy tag-0
+    # training edges (PP/DP) are matched by order and skipped inside the check
+    assert_tag_uniqueness(nodes)
     write_nodes(nodes, name, path=et_dir)
 
     print(f"Wrote {'training' if training else 'inference'} ET for {len(nodes)} npus to {et_dir}")

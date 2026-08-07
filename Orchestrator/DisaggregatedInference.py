@@ -127,10 +127,11 @@ class DisaggregatedInference(Orchestrator):
 
     def _origin_tokens(self, pool: str, tokens_per_slice: List[int]) -> List[int]:
         """Tokens owned by each device of a stage. Sequence parallelism splits a slice's tokens
-        across its tp ranks, so a device owns 1/tp of its slice."""
+        across its tp ranks; the remainder goes to the lowest tp ranks so that no token is
+        dropped when the slice is smaller than tp (the decode regime)."""
         cfg = self.prefill_cfg if pool == "p" else self.decode_cfg
-        return [tokens_per_slice[dp] // cfg.tp_size
-                for dp in range(cfg.dp_size) for _ in range(cfg.tp_size)]
+        return [tokens_per_slice[dp] // cfg.tp_size + (tp < tokens_per_slice[dp] % cfg.tp_size)
+                for dp in range(cfg.dp_size) for tp in range(cfg.tp_size)]
 
     def _new_tokens(self, request_idxs: List[int]) -> int:
         """Prompt tokens actually computed for a set of requests (prefix cache already excluded)."""

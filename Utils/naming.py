@@ -5,6 +5,9 @@ _ORDER = ("pl", # stands for pool --> prefill (p) or decode (d), or training (t)
            "ss", # stands for scr pp stage
            "ds", # stands for dst pp stage
            "sh", # stands for tp shard id
+           "dp", # stands for dp slice (request-parallel rank; omitted when dp_size == 1)
+           "sdp", # stands for src dp slice (for kv/firsttok, where src and dst differ)
+           "ddp", # stands for dst dp slice (for kv/firsttok, where src and dst differ)
            "ssh", # stands for src tp shard id (for kv, where src and dst differ)
            "dsh", # stands for dst tp shard id (for kv, where src and dst differ)
            "cl", # stands for EP cluster (which expert-weight replica the a2a belongs to)
@@ -41,9 +44,9 @@ def comm_tag(name: str) -> int:
     return zlib.crc32(name.encode()) % _TAG_MOD
 
 # --- compute graph inside a block (orchestrator -> layer) ------------------
-def comp_base(*, pl, ss, sh, L, it) -> str:
+def comp_base(*, pl, ss, sh, L, it, dp=None) -> str:
     """Schedule position the orchestrator hands to the layer. NOT A FINAL NAME, but a base that the layer appends op + class via comp_name / coll_name."""
-    f = dict(pl=pl, ss=ss, sh=sh, L=L, it=it)
+    f = dict(pl=pl, ss=ss, sh=sh, dp=dp, L=L, it=it)
     return "_".join(f"{k}={f[k]}" for k in _ORDER if f.get(k) is not None)
 
 def comp_name(base: str, op: str) -> str:
@@ -53,19 +56,19 @@ def coll_name(base: str, op: str) -> str:
     return f"TP_{base}_op={op}"
 
 # --- orchestrator point-to-point edges -------------------------------------
-def pp_name(*, pl, src_stage, dst_stage, sh, it) -> str:
-    return _assemble("PP", dict(pl=pl, ss=src_stage, ds=dst_stage, sh=sh, it=it))
+def pp_name(*, pl, src_stage, dst_stage, sh, it, dp=None) -> str:
+    return _assemble("PP", dict(pl=pl, ss=src_stage, ds=dst_stage, sh=sh, dp=dp, it=it))
 
 def a2a_name(*, pl, op, stage, se, de, L, it, cl=None) -> str:
     """MoE dispatch/combine edge. Identical on the SEND and the RECV of the same oriented edge"""
     return _assemble("A2A", dict(pl=pl, ss=stage, cl=cl, se=se, de=de, L=L, op=op, it=it))
 
-def kv_name(*, src_stage, dst_stage, ssh, dsh, it, L=None, seg=None, se=None, de=None) -> str:
-    return _assemble("KV", dict(ss=src_stage, ds=dst_stage, ssh=ssh, dsh=dsh, se=se, de=de, L=L, seg=seg, it=it))
+def kv_name(*, src_stage, dst_stage, ssh, dsh, it, L=None, seg=None, se=None, de=None, sdp=None, ddp=None) -> str:
+    return _assemble("KV", dict(ss=src_stage, ds=dst_stage, sdp=sdp, ddp=ddp, ssh=ssh, dsh=dsh, se=se, de=de, L=L, seg=seg, it=it))
 
-def firsttok_name(*, src_stage, dst_stage, dsh, it, se=None, de=None) -> str:
-    return _assemble("FIRSTTOK", dict(ss=src_stage, ds=dst_stage, dsh=dsh, se=se, de=de, it=it))
+def firsttok_name(*, src_stage, dst_stage, dsh, it, se=None, de=None, sdp=None, ddp=None) -> str:
+    return _assemble("FIRSTTOK", dict(ss=src_stage, ds=dst_stage, sdp=sdp, ddp=ddp, dsh=dsh, se=se, de=de, it=it))
 
-def decfb_name(*, pl, src_stage, dst_stage, sh, it) -> str:
+def decfb_name(*, pl, src_stage, dst_stage, sh, it, dp=None) -> str:
     # Decode feedback edge. Similar to pp edge but goes back from dst_stage to src_stage, and carries the token just produced at dst_stage back to src_stage for the next decode iteration.
-    return _assemble("DECFB", dict(pl=pl, ss=src_stage, ds=dst_stage, sh=sh, it=it))
+    return _assemble("DECFB", dict(pl=pl, ss=src_stage, ds=dst_stage, sh=sh, dp=dp, it=it))

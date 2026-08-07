@@ -63,11 +63,16 @@ class MoeRoutingConfig:
 
 @dataclass(frozen=True) 
 class ParallelismConfig:
-    """Tensor-, pipeline- and data-parallel degrees. Shared by training and inference
-     Expert mesh: etp * ep == tp * dp, i.e. ep = tp*dp // etp, with
-      - training  (Megatron-Core defaults, "ETP mode"): etp = tp  =>  ep = dp
-      - inference (vLLM serving, "EP mode"):  etp = 1   =>  ep = tp*dp
-    so `ep` is never a free knob and is never configured
+    """Tensor-, pipeline- and data-parallel degrees. Shared by training and inference.
+
+    Expert mesh (MoE Parallel Folding over the tp*dp devices of a stage): experts are always
+    kept WHOLE (etp = 1), so ep can span up to the full stage:
+      - default: ep = tp*dp (one cluster, no expert replicas) — vLLM serving behaviour, and
+        Megatron-Core's ETP=1 folding used for fine-grained MoEs;
+      - training may set ep_size < tp*dp to replicate experts over edp = tp*dp/ep clusters,
+        which adds the expert-DP gradient all-reduce (Megatron's expert-data-parallelism);
+      - inference rejects ep_size < tp*dp (EPLB-style redundancy is not modelled).
+    Megatron-Core's other mode (ETP = tp, experts sharded by tensor rank) is NOT modelled.
     DP in inference is only meaningful for MoE models, for dense models it would only produce independent replicas with identical traces, so it is rejected there"""
     tp_size: int = 1
     pp_size: int = 1

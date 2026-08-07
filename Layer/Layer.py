@@ -20,7 +20,10 @@ class MoeEpContext:
     peers: List[int]    # npu_ids of this cluster; index i == EP rank i == row/col i of the matrix
     ep_rank: int        # this device's position in `peers`, i.e. its row/column in the matrix
     cluster: int = 0    # which expert-weight replica this device belongs to (0 .. edp-1)
+    clusters: int = 1   # how many expert-weight replicas exist (edp); disambiguates a2a names when > 1
     stage: int = 0      # this device's pipeline stage (naming only)
+    pool: str = "t"     # "p"/"d" for the inference pools, "t" for training (naming only)
+    origin_tokens: List[int] | None = None  # tokens each peer routes; None = every peer routes the caller's local count
     pg_name: str | None = None   # EP process group, used only by the collective dispatch path
 
     @property

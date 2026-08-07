@@ -42,12 +42,16 @@ class MoeBlock:
         top_k, num_experts = self.moe.top_k, self.moe.num_experts
         hidden, b, scale = self.hidden_size, self.bytes_per_val, self.scale
 
+        origin_tokens = ep_ctx.origin_tokens or [local_tokens] * ep_ctx.size
+        # the tokens this device owns are its entry of origin_tokens, kept consistent with its
+        # row of the traffic matrix (the caller's local_tokens is only the uniform fallback)
+        local_tokens = origin_tokens[ep_ctx.ep_rank]
+
         # router: [tokens, hidden] x [hidden, E]. A small matrix, replicated across the tensor
         # ranks rather than sharded, so its cost is not divided further.
         gate_flops = int(scale * 2 * local_tokens * hidden * num_experts)
         gate_bytes = int(scale * local_tokens * hidden * b)
 
-        origin_tokens = ep_ctx.origin_tokens or [local_tokens] * ep_ctx.size
         traffic = self.plan.traffic_matrix(key, self.layer_idx, origin_tokens)
         tokens_routed_here = int(traffic[:, ep_ctx.ep_rank].sum())   # column sum, diagonal included
         expert_flops, expert_bytes = self.expert_math.ffn_costs(tokens_routed_here, weight_copies=num_experts // ep_ctx.size)

@@ -101,7 +101,7 @@ class ComputeWrapper(BaseWrapper):
                 if attr_val(op, "num_ops") == 0 and attr_val(op, "tensor_size") == 0:
                     continue  # zero-cost barrier nodes (MoE tails): a slowdown of 0 is pure noise
                 slow_node = compute(int(attr_val(op, "num_ops") * slowdown),
-                                    int(attr_val(op, "tensor_size") * slowdown),
+                                    max(1, int(attr_val(op, "tensor_size") * slowdown)),
                                     parents=[op], name=f"{op.name}_slowdown")
                 # Rewire EVERY dependent of op onto the slowdown node.
                 for j in range(i + 1, len(ops)):

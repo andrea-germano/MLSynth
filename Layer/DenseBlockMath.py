@@ -93,12 +93,15 @@ class DenseBlockMath:
         ))
         return flops, mem
 
-    def ffn_costs(self, tokens) -> Tuple[int, int]:
-        """(flops, bytes) of the FFN block for the given number of tokens."""
+    def ffn_costs(self, tokens, weight_copies: int = 1) -> Tuple[int, int]:
+        """(flops, bytes) of the FFN block for the given number of tokens.
+
+        weight_copies: how many FFN weight sets this device holds (1 for dense; the local
+        expert count E/ep for an MoE block, whose experts are whole, tp_size=1)."""
         b = self.bytes_per_val
         flops = int(self.scale * (tokens * self.ffn_flops_per_token) // self.tp_size)
         mem = int(self.scale * (
-            self.ffn_weight_elems * b // self.tp_size                  # FFN weights (sharded)
+            weight_copies * self.ffn_weight_elems * b // self.tp_size  # FFN weights (sharded)
             + 2 * tokens * self.hidden_size * b                        # input + output activations
         ))
         return flops, mem
