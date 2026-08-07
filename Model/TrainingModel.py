@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from Model.Interfaces import BaseTrainingModel
+from mlsynth.Model.Model import BaseTrainingModel
 from Layer.TrainingLayer import TrainingLayer
 from Utils.config import TrainRunConfig
 from chakra.schema.protobuf.et_def_pb2 import (

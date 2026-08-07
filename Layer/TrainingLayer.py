@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from Layer.Interfaces import BaseTrainingLayer
+from mlsynth.Layer.Layer import BaseTrainingLayer
 from Layer.DenseBlockMath import DenseBlockMath
 from Utils.config import ModelConfig
 from Utils.nodes import allreduce, compute

@@ -4,8 +4,8 @@ from typing import Dict, List, Optional, Tuple
 from chakra.schema.protobuf.et_def_pb2 import GlobalMetadata
 
 from Utils.config import RunConfig
-from Orchestrator.Interfaces import Orchestrator
-from Model.Interfaces import BaseInferenceModel
+from mlsynth.Orchestrator.Orchestrator import Orchestrator
+from mlsynth.Model.Model import BaseInferenceModel
 from Utils.nodes import add_dependencies, send, receive
 from Utils.naming import (comp_base, pp_name, kv_name, firsttok_name, decfb_name, comm_tag)
 

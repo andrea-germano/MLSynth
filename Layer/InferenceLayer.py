@@ -1,7 +1,7 @@
 from typing import List
 from chakra.schema.protobuf.et_def_pb2 import Node as ChakraNode
 
-from Layer.Interfaces import BaseInferenceLayer, LayerEmission
+from mlsynth.Layer.Layer import BaseInferenceLayer, LayerEmission
 from Layer.DenseBlockMath import DenseBlockMath
 from Utils.nodes import compute, allreduce
 from Utils.naming import comp_name, coll_name

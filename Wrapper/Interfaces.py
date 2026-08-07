@@ -17,7 +17,7 @@ from abc import ABC, abstractmethod
 from typing import List
 from chakra.schema.protobuf.et_def_pb2 import Node as ChakraNode
 
-from Layer.Interfaces import LayerEmission
+from mlsynth.Layer.Layer import LayerEmission
 
 
 class BaseWrapper(ABC):

@@ -1,7 +1,7 @@
 from typing import List
 
-from Model.Interfaces import BaseInferenceModel
-from Layer.Interfaces import LayerEmission
+from mlsynth.Model.Model import BaseInferenceModel
+from mlsynth.Layer.Layer import LayerEmission
 from Layer.InferenceLayer import InferenceLayer
 from Utils.config import ModelConfig, ParallelismConfig
 

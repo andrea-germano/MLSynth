@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from typing import List, Optional
-from Utils.naming import pg_for_name
+from Utils.naming import comm_tag, pg_for_name
 from chakra.schema.protobuf.et_def_pb2 import (
     Node as ChakraNode,
     NodeType as ChakraNodeType,
@@ -102,3 +102,38 @@ def alltoall(coll_size: int, pg_name: Optional[str] = None, name: str = "COMM_CO
         node.attr.append(ChakraAttr(name="pg_name", string_val=pg_name))
     add_dependencies(node, parents)
     return node
+
+def alltoall_v(matrix, peers: List[int], ep_rank: int, *, size_for, name_for, parents: Optional[List[ChakraNode]] = None):
+    """Emit an ASYMMETRIC all-to-all: this rank's row as SENDs and its column as RECVs.
+
+    Chakra offers ALL_TO_ALL but no ALL_TO_ALL_V: the collective carries a single scalar
+    comm_size and ASTRA-sim lowers it to a uniform msg_size = comm_size/N, so a per-destination
+    traffic matrix cannot be expressed. This builds the variable version out of point-to-point
+    primitives -- which is also how the real stack does it, since NCCL has no all-to-all verb
+    either and implements one with ncclSend/ncclRecv inside a group call.
+
+    `matrix[src][dst]` is the payload count from EP rank src to EP rank dst, `size_for(count)`
+    converts it to bytes, and `name_for(src, dst)` names the oriented edge. The name is what pairs the two
+    endpoints: the SEND and its RECV get the same name, hence the same comm_tag, which is
+    ASTRA-sim's matching condition -- deriving the tag here rather than at the call site keeps
+    that invariant impossible to break.
+
+    The diagonal is skipped (local payload never hits the network) and so are empty edges.
+    Returns (all emitted nodes, the RECVs) -- the latter gate whatever consumes the exchange."""
+    nodes, recvs = [], []
+    for peer in range(len(peers)):
+        if peer == ep_rank:
+            continue
+        outgoing = int(matrix[ep_rank][peer])
+        if outgoing:
+            name = name_for(ep_rank, peer)
+            nodes.append(send(peers[ep_rank], peers[peer], size_for(outgoing),
+                              name=name, parents=parents, tag=comm_tag(name)))
+        incoming = int(matrix[peer][ep_rank])
+        if incoming:
+            name = name_for(peer, ep_rank)
+            node = receive(peers[peer], peers[ep_rank], size_for(incoming),
+                           name=name, parents=parents, tag=comm_tag(name))
+            nodes.append(node)
+            recvs.append(node)
+    return nodes, recvs

@@ -3,7 +3,7 @@ from abc import ABC, abstractmethod
 from typing import List
 from chakra.schema.protobuf.et_def_pb2 import Node as ChakraNode
 
-from Layer.Interfaces import LayerEmission
+from mlsynth.Layer.Layer import LayerEmission, MoeEpContext
 from Utils.config import ModelConfig, ParallelismConfig
 
 
@@ -15,14 +15,24 @@ class BaseTrainingModel(ABC):
     consumed by wrappers (e.g. per-NPU slowdowns)."""
 
     @abstractmethod
-    def fwd(self, name: str, npu_id: int, layer: int, num_batches: float, pg_name: str | None = None) -> List[ChakraNode]:
-        """Return forward-pass operations for the given layer and microbatch count."""
+    def fwd(self, name: str, npu_id: int, layer: int, num_batches: float, pg_name: str | None = None, microbatch: int = 0, ep_ctx: MoeEpContext | None = None) -> List[ChakraNode]:
+        """Return forward-pass operations for the given layer and microbatch count"""
         raise NotImplementedError
 
     @abstractmethod
-    def bckwd(self, name: str, npu_id: int, layer: int, num_batches: float, pg_name: str | None = None) -> List[ChakraNode]:
+    def bckwd(self, name: str, npu_id: int, layer: int, num_batches: float, pg_name: str | None = None, microbatch: int = 0, ep_ctx: MoeEpContext | None = None) -> List[ChakraNode]:
         """Return backward-pass operations for the given layer and microbatch count."""
         raise NotImplementedError
+
+    @property
+    def dp_sync_params(self) -> float:
+        """Parameters carried by the DP all-reduce. Equals num_params for dense models; MoE models override it to exclude the expert weights, which are reduced separately."""
+        return self.num_params
+
+    @property
+    def expert_sync_params(self) -> float:
+        """Parameters carried by the expert-DP all-reduce: none unless the model has replicated experts (edp > 1), which only MoE models can have."""
+        return 0.0
 
 
 class BaseInferenceModel(ABC):

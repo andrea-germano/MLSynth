@@ -14,6 +14,20 @@ class LayerEmission:
     kv_ready: ChakraNode
 
 
+@dataclass(frozen=True)
+class MoeEpContext:
+    """The expert-parallel group an MoE layer emits its all-to-all over"""
+    peers: List[int]    # npu_ids of this cluster; index i == EP rank i == row/col i of the matrix
+    ep_rank: int        # this device's position in `peers`, i.e. its row/column in the matrix
+    cluster: int = 0    # which expert-weight replica this device belongs to (0 .. edp-1)
+    stage: int = 0      # this device's pipeline stage (naming only)
+    pg_name: str | None = None   # EP process group, used only by the collective dispatch path
+
+    @property
+    def size(self) -> int:
+        return len(self.peers)
+
+
 class BaseTrainingLayer(ABC):
     """Interface for a layer in a model that supports training.
 

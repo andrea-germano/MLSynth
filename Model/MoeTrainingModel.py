@@ -13,51 +13,50 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from Model.Interfaces import BaseTrainingModel
+from mlsynth.Model.Model import BaseTrainingModel
+from mlsynth.Layer.Layer import MoeEpContext
 from Layer.MoeTrainingLayer import MoeTrainingLayer
 from Utils.config import TrainRunConfig
+from Utils.routing import RoutingPlan
 from chakra.schema.protobuf.et_def_pb2 import (
     Node as ChakraNode,
 )
 
 
 class MoeTrainingModel(BaseTrainingModel):
-    """Mixture-of-Experts transformer model for training.
-    Unlike the dense models, the model is NOT homogeneous: each layer gets its own
-    MoeTrainingLayer instance (experts/routing may differ per layer).
+    """Mixture-of-Experts transformer model for training"""
 
-    ⚠ INCOMPLETE and not wired into any entry point: the layer is the ORIGINAL legacy
-    implementation (see MoeTrainingLayer's warning), num_params uses the legacy formula.
-    MoE-specific knobs stay explicit kwargs since the config schema does not model them."""
-
-    def __init__(self, run: TrainRunConfig, ep_size: int, top_k: int = 1, capacity_factor: float = 1.25):
+    def __init__(self, run: TrainRunConfig):
         self._model_cfg = run.model
         self._training = run.training
         self._tp_size = run.parallelism.tp_size
-        self.ep_size = ep_size
+        self._ep_size = run.parallelism.ep
+        self._edp_size = run.parallelism.edp
+        self.moe = run.model.moe
+        # one plan shared by every layer: it holds the per-layer popularity vectors and the
+        # matrix cache, and every rank rebuilds identical matrices from the seeded RNG
+        self.plan = RoutingPlan(self.moe, run.moe_routing)
 
-        # Model is composed of MoE layers, one instance per layer
         self.layers = [
             MoeTrainingLayer(
-                num_layers=run.model.num_layers,
-                hidden_size=run.model.hidden_size,
+                model_cfg=run.model,
                 sequence_len=run.training.sequence_len,
-                vocab_size=run.model.vocab_size,
-                ep_size=ep_size,
                 tp_size=run.parallelism.tp_size,
-                top_k=top_k,
-                capacity_factor=capacity_factor,
-                bytes_per_val=run.model.bytes_per_val,
-                scale=run.model.scale,
+                plan=self.plan,
+                layer_idx=idx,
             )
-            for _ in range(run.model.num_layers)
+            for idx in range(run.model.num_layers)
         ]
 
-    def fwd(self, name, npu_id, layer, num_batches, pg_name=None) -> list[ChakraNode]:
-        return self._layer_for(layer).fwd(name=name, num_batches=num_batches, pg_name=pg_name)
+    def fwd(self, name, npu_id, layer, num_batches, pg_name=None, microbatch: int = 0,
+            ep_ctx: MoeEpContext | None = None) -> list[ChakraNode]:
+        return self._layer_for(layer).fwd(name=name, num_batches=num_batches, pg_name=pg_name,
+                                          ep_ctx=ep_ctx, microbatch=microbatch)
 
-    def bckwd(self, name, npu_id, layer, num_batches, pg_name=None) -> list[ChakraNode]:
-        return self._layer_for(layer).bckwd(name=name, num_batches=num_batches, pg_name=pg_name)
+    def bckwd(self, name, npu_id, layer, num_batches, pg_name=None, microbatch: int = 0,
+              ep_ctx: MoeEpContext | None = None) -> list[ChakraNode]:
+        return self._layer_for(layer).bckwd(name=name, num_batches=num_batches, pg_name=pg_name,
+                                            ep_ctx=ep_ctx, microbatch=microbatch)
 
     def _layer_for(self, idx: int) -> MoeTrainingLayer:
         return self.layers[idx]
@@ -70,12 +69,29 @@ class MoeTrainingModel(BaseTrainingModel):
         return self._model_cfg
 
     @property
+    def expert_params(self) -> float:
+        """FFN weights of every expert, over all layers (the whole model, not the local shard)."""
+        return float(sum(layer.math.ffn_weight_elems for layer in self.layers) * self.moe.num_experts)
+
+    @property
     def num_params(self) -> float:
-        # ⚠ ORIGINAL legacy formula, kept on purpose (like the layer): dense 4d²-attention
-        # accounting, no GQA/SwiGLU, no per-expert FFN replication. TODO align with DenseBlockMath.
         d, L, V = self._model_cfg.hidden_size, self._model_cfg.num_layers, self._model_cfg.vocab_size
-        S = self._training.sequence_len
-        return 12 * L * d * d * (1 + (13 / (12 * L * d)) + ((V + S) / (12 * L * d)))
+        attn_weights = sum(layer.math.attn_weight_elems for layer in self.layers)
+        router = L * d * self.moe.num_experts
+        embedding = 2 * V * d  # embedding + lm head
+        norms = (2 * L + 1) * d
+        return float(attn_weights + router + embedding + norms) + self.expert_params
+
+    @property
+    def dp_sync_params(self) -> float:
+        """Parameters carried by the DP all-reduce: the non-expert ones. Expert gradients live
+        on the expert-DP group instead (and stay local when edp == 1)."""
+        return self.num_params - self.expert_params
+
+    @property
+    def expert_sync_params(self) -> float:
+        """Expert parameters per rank, all-reduced over the expert-DP group when edp > 1."""
+        return self.expert_params / self._ep_size if self._edp_size > 1 else 0.0
 
     def get_num_params(self) -> float:
         return self.num_params
