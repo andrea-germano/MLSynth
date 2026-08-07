@@ -3,10 +3,12 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 from chakra.schema.protobuf.et_def_pb2 import GlobalMetadata
 
-from Utils.config import RunConfig
-from mlsynth.Orchestrator.Orchestrator import Orchestrator
-from mlsynth.Model.Model import BaseInferenceModel
+from Utils.config import InferenceRunConfig
+from Orchestrator.Orchestrator import Orchestrator
+from Model.Model import BaseInferenceModel
 from Utils.nodes import add_dependencies, send, receive
+from Layer.Layer import MoeEpContext
+from Utils.routing import PHASE_DECODE, PHASE_PREFILL
 from Utils.naming import (comp_base, pp_name, kv_name, firsttok_name, decfb_name, comm_tag)
 
 # size of bytes of the sampled token feedback (used for serialization of decode iterations and for the first token handoff from prefill to decode)
@@ -21,7 +23,7 @@ class DisaggregatedInference(Orchestrator):
     #Prefill pool: NPU ids [0, num_prefill_npus),
     #Decode pool: NPU ids [num_prefill_npus, num_prefill_npus + num_decode_npus)
 
-    def __init__(self, model: BaseInferenceModel, run: RunConfig):
+    def __init__(self, model: BaseInferenceModel, run: InferenceRunConfig):
         self.run = run
         self.model = model
 
@@ -62,47 +64,108 @@ class DisaggregatedInference(Orchestrator):
         self.max_decode_steps = max(req.gen_len for req in self.requests)
 
         self.kv_dim=run.model.key_value_dim # = hidden for MHA and kv_heads*head_dim for GQA
-        self.kv_bytes_per_layer = int(self.scale * 2 * self.kv_dim * self.bytes_per_val * self.computed_tokens)
-
-        # PP activations transfer size
-        self.pp_prefill_bytes= int(self.scale * self.computed_tokens * self.hidden_size * self.bytes_per_val)
+        self.moe = run.model.moe
 
         self._stream_recv: Dict[Tuple[int,int], List] = defaultdict(list) # (layer, dst) -> recvs
         self._bulk_recv: Dict[int, List] = defaultdict(list) # dst -> recvs
 
-    def _get_prefill_npu_id(self, pp_stage:int, tp_rank:int) -> int:
-        return (pp_stage * self.prefill_cfg.tp_size) + tp_rank
-    
-    def _get_decode_npu_id(self, pp_stage:int, tp_rank:int) -> int:
-        return self.prefill_npus + (pp_stage * self.decode_cfg.tp_size) + tp_rank
-    
-    def _get_prefill_coord(self, npu_id: int) -> Tuple[int,int]: # returns (pp_stage, tp_rank) given an npu_id in the prefill pool
-        tp = self.prefill_cfg.tp_size
-        return (npu_id // tp, npu_id % tp)
-    
-    def _get_decode_coord(self, npu_id: int) -> Tuple[int,int]: # returns (pp_stage, tp_rank) given an npu_id in the decode pool
-        tp = self.decode_cfg.tp_size
-        offset = npu_id - self.prefill_npus
-        return (offset // tp, offset % tp)
+    # Device layout of a pool: pipeline stages are contiguous blocks of tp*dp devices
+    def _get_prefill_npu_id(self, pp_stage: int, tp_rank: int, dp_rank: int = 0) -> int:
+        cfg = self.prefill_cfg
+        return (pp_stage * cfg.dp_size + dp_rank) * cfg.tp_size + tp_rank
+
+    def _get_decode_npu_id(self, pp_stage: int, tp_rank: int, dp_rank: int = 0) -> int:
+        cfg = self.decode_cfg
+        return self.prefill_npus + (pp_stage * cfg.dp_size + dp_rank) * cfg.tp_size + tp_rank
+
+    def _get_prefill_coord(self, npu_id: int) -> Tuple[int, int, int]:
+        """(pp_stage, tp_rank, dp_rank) of an npu in the prefill pool."""
+        cfg = self.prefill_cfg
+        stage, within = divmod(npu_id, cfg.tp_size * cfg.dp_size)
+        dp_rank, tp_rank = divmod(within, cfg.tp_size)
+        return (stage, tp_rank, dp_rank)
+
+    def _get_decode_coord(self, npu_id: int) -> Tuple[int, int, int]:
+        """(pp_stage, tp_rank, dp_rank) of an npu in the decode pool."""
+        cfg = self.decode_cfg
+        stage, within = divmod(npu_id - self.prefill_npus, cfg.tp_size * cfg.dp_size)
+        dp_rank, tp_rank = divmod(within, cfg.tp_size)
+        return (stage, tp_rank, dp_rank)
+
+    # Requests are assigned round-robin to the dp ranks of a pool. That is the static limit of what vLLM's router does
+    def _owner(self, request_idx: int, dp_size: int) -> int:
+        return request_idx % dp_size
+
+    def _slice(self, dp_rank: int, dp_size: int) -> List[int]:
+        """Indices of the requests owned by one dp rank."""
+        return [i for i in range(len(self.requests)) if i % dp_size == dp_rank]
+
+    @staticmethod
+    def _dp_field(dp_rank: int, cfg) -> int | None:
+        """dp coordinate for a node name, omitted when there is a single slice so that dense traces keep their original names."""
+        return dp_rank if cfg.dp_size > 1 else None
+
+    def _ep_context(self, pool: str, stage: int, dp_rank: int, tp_rank: int,
+                    origin_tokens: List[int]) -> MoeEpContext:
+        """The expert-parallel group of one device: every device of its pipeline stage, since in
+        serving ep = tp * dp with whole experts (etp = 1, edp = 1)"""
+        cfg = self.prefill_cfg if pool == "p" else self.decode_cfg
+        npu_of = self._get_prefill_npu_id if pool == "p" else self._get_decode_npu_id
+        peers = [npu_of(stage, tp, dp)
+                 for dp in range(cfg.dp_size) for tp in range(cfg.tp_size)]
+        return MoeEpContext(peers=peers, ep_rank=dp_rank * cfg.tp_size + tp_rank, cluster=0,
+                            stage=stage, pool=pool, origin_tokens=origin_tokens)
+
+    def _moe_kwargs(self, pool: str, stage: int, dp_rank: int, tp_rank: int,
+                    origin_tokens, key: tuple, step: int = 0) -> dict:
+        """Extra arguments the MoE layers need; empty for a dense model, so the dense call site
+        is unchanged."""
+        if not self.moe:
+            return {}
+        return {"ep_ctx": self._ep_context(pool, stage, dp_rank, tp_rank, origin_tokens),
+                "key": key, "step": step}
+
+    def _origin_tokens(self, pool: str, tokens_per_slice: List[int]) -> List[int]:
+        """Tokens owned by each device of a stage. Sequence parallelism splits a slice's tokens
+        across its tp ranks, so a device owns 1/tp of its slice."""
+        cfg = self.prefill_cfg if pool == "p" else self.decode_cfg
+        return [tokens_per_slice[dp] // cfg.tp_size
+                for dp in range(cfg.dp_size) for _ in range(cfg.tp_size)]
+
+    def _new_tokens(self, request_idxs: List[int]) -> int:
+        """Prompt tokens actually computed for a set of requests (prefix cache already excluded)."""
+        return sum(self.requests[i].prompt_len - self.requests[i].cached_len for i in request_idxs)
+
+    def _kv_bytes(self, tokens: int) -> int:
+        """Bytes of one layer's KV cache for `tokens` tokens, full hidden dimension."""
+        return int(self.scale * 2 * self.kv_dim * self.bytes_per_val * tokens)
+
+    def _activation_bytes(self, tokens: int) -> int:
+        return int(self.scale * tokens * self.hidden_size * self.bytes_per_val)
 
     # SINGLE SOURCE OF TRUTH for the pg_names. They are used both when building comm_groups.json (generate_comm_groups) and when tagging the COMM_COLL nodes (_emit_prefill / _emit_decode).
     #They must be integers since astra-sim only supports integer pg names
-    def _prefill_tp_pg(self, pp_stage: int) -> str:
-        return str(pp_stage+1)
+    def _prefill_tp_pg(self, pp_stage: int, dp_rank: int = 0) -> str:
+        return str(pp_stage * self.prefill_cfg.dp_size + dp_rank + 1)
 
-    def _decode_tp_pg(self, pp_stage: int) -> str:
-        return str(self.prefill_cfg.pp_size + pp_stage+1)
+    def _decode_tp_pg(self, pp_stage: int, dp_rank: int = 0) -> str:
+        base = self.prefill_cfg.pp_size * self.prefill_cfg.dp_size
+        return str(base + pp_stage * self.decode_cfg.dp_size + dp_rank + 1)
 
     def generate_comm_groups(self) -> dict:
         groups: Dict[str, List[int]] = {}
         if self.prefill_cfg.tp_size > 1:
             for stage in range(self.prefill_cfg.pp_size):
-                group_name = self._prefill_tp_pg(stage)
-                groups[group_name] = [self._get_prefill_npu_id(stage, rank) for rank in range(self.prefill_cfg.tp_size)]
+                for dp_rank in range(self.prefill_cfg.dp_size):
+                    groups[self._prefill_tp_pg(stage, dp_rank)] = [
+                        self._get_prefill_npu_id(stage, rank, dp_rank)
+                        for rank in range(self.prefill_cfg.tp_size)]
         if self.decode_cfg.tp_size > 1:
             for stage in range(self.decode_cfg.pp_size):
-                group_name = self._decode_tp_pg(stage)
-                groups[group_name] = [self._get_decode_npu_id(stage, rank) for rank in range(self.decode_cfg.tp_size)]
+                for dp_rank in range(self.decode_cfg.dp_size):
+                    groups[self._decode_tp_pg(stage, dp_rank)] = [
+                        self._get_decode_npu_id(stage, rank, dp_rank)
+                        for rank in range(self.decode_cfg.tp_size)]
         return groups
     
     def exec(self) -> dict:
@@ -118,57 +181,80 @@ class DisaggregatedInference(Orchestrator):
 
         return nodes
     
-    def _kv_edges(self, layer: int) -> List[Tuple[int,int,int]]:
-        """Return the list of edges needed to transfer the KV cache of a given layer from the prefill pool to the decode pool. Each edge is a tuple (src_npu, dst_npu, bytes)."""
-        tp_prefill, tp_decode = self.prefill_cfg.tp_size, self.decode_cfg.tp_size
+    def _kv_edges(self, layer: int) -> List[Tuple[int, int, int]]:
+        """Edges carrying one layer's KV cache from the prefill pool to the decode pool, as
+        (src_npu, dst_npu, bytes).
+
+        Two independent reshardings compose here. Along dp the KV follows the REQUESTS: a prefill
+        dp rank sends to a decode dp rank only the cache of the requests they both own, so the
+        payload of a (src_dp, dst_dp) pair is the intersection of their slices. Along tp it
+        follows the existing head sharding, unchanged."""
+        cfg_p, cfg_d = self.prefill_cfg, self.decode_cfg
         prefill_stage = layer // self.layer_per_stage_prefill
         decode_stage = layer // self.layer_per_stage_decode
-        prefill_npus = [self._get_prefill_npu_id(prefill_stage, rank) for rank in range(tp_prefill)]
-        decode_npus = [self._get_decode_npu_id(decode_stage, rank) for rank in range(tp_decode)]
-        full_size = self.kv_bytes_per_layer
-        edges: List[Tuple[int,int,int]] = []
 
-        if tp_prefill == tp_decode:
-            #Mapping 1:1
-            bytes_per_edge = full_size // tp_prefill
-            edges = [(prefill_npus[rank], decode_npus[rank], bytes_per_edge) for rank in range(tp_prefill)]
-        elif tp_decode % tp_prefill == 0:
-            # decode pool has more TP shards, each prefill shard sends to multiple decode shards (1:k)
-            k = tp_decode // tp_prefill
-            bytes_per_edge = full_size // tp_decode
-            for rank in range(tp_prefill):
-                for j in range(k):
-                    edges.append((prefill_npus[rank], decode_npus[rank*k + j], bytes_per_edge))
-        elif tp_prefill % tp_decode == 0:
-            # prefill pool has more TP shards, each decode shard receives from multiple prefill shards and merges them (k:1)
-            k = tp_prefill // tp_decode
-            bytes_per_edge = full_size // tp_prefill
-            for rank in range(tp_prefill):
-                edges.append((prefill_npus[rank], decode_npus[rank // k], bytes_per_edge))
-        else:
-            # This should be prevented by the config validation, but we check again for safety
-            raise ValueError("TP sizes must divide one another (checked in Config)")        
+        edges: List[Tuple[int, int, int]] = []
+        for src_dp in range(cfg_p.dp_size):
+            owned = self._slice(src_dp, cfg_p.dp_size)
+            for dst_dp in range(cfg_d.dp_size):
+                shared = [i for i in owned if self._owner(i, cfg_d.dp_size) == dst_dp]
+                if not shared:
+                    continue
+                prefill_npus = [self._get_prefill_npu_id(prefill_stage, rank, src_dp)
+                                for rank in range(cfg_p.tp_size)]
+                decode_npus = [self._get_decode_npu_id(decode_stage, rank, dst_dp)
+                               for rank in range(cfg_d.tp_size)]
+                edges.extend(self._tp_reshard(prefill_npus, decode_npus, self._kv_bytes(self._new_tokens(shared))))
         return edges
-    
+
+    @staticmethod
+    def _tp_reshard(src_npus: List[int], dst_npus: List[int],
+                    full_size: int) -> List[Tuple[int, int, int]]:
+        """Split one (src_dp, dst_dp) payload across the tensor shards.
+
+        Both pools shard the KV heads, so cut the payload into the FINEST common sharding --
+        max(tp_src, tp_dst) pieces -- and give each piece its one owner on either side. That
+        covers 1:1, the 1:k fan-out when the decode pool has more shards, and the k:1 merge when
+        it has fewer, without a branch each. The tp degrees divide one another (config-checked),
+        so every piece maps to exactly one shard per side."""
+        tp_src, tp_dst = len(src_npus), len(dst_npus)
+        if max(tp_src, tp_dst) % min(tp_src, tp_dst):
+            raise ValueError("TP sizes must divide one another (checked in Config)")
+        shards = max(tp_src, tp_dst)
+        per_shard = full_size // shards
+        return [(src_npus[s * tp_src // shards], dst_npus[s * tp_dst // shards], per_shard)
+                for s in range(shards)]
+
     # ------------------------------------------------------------------ #
     # First phase: prefill
     # ------------------------------------------------------------------ #
     def _emit_prefill(self, nodes: Dict, last_node_per_npu: Dict) -> Dict[Tuple[int,int], object]:
         """Emit the prefill pass, return the dict describing the kv_ready[(layer, src_npu)] nodes after which the KV cache of each layer is ready to be sent to the decode pool."""
         kv_ready_hooks: Dict[Tuple[int,int], object] = {}
-        tp_size = self.prefill_cfg.tp_size
+        cfg = self.prefill_cfg
+        tp_size, dp_size = cfg.tp_size, cfg.dp_size
+        stage_stride = tp_size * dp_size          # devices per pipeline stage
 
-        for stage in range(self.prefill_cfg.pp_size):
+        tokens_per_slice = [self._new_tokens(self._slice(dp, dp_size)) for dp in range(dp_size)]
+        origin_tokens = self._origin_tokens("p", tokens_per_slice) if self.moe else None
+
+        for stage in range(cfg.pp_size):
+          for dp_rank in range(dp_size):
+            owned = self._slice(dp_rank, dp_size)
+            prompt_lens = [self.requests[i].prompt_len for i in owned]
+            cached_lens = [self.requests[i].cached_len for i in owned]
+            pp_bytes = self._activation_bytes(self._new_tokens(owned))
             for rank in range(tp_size):
-                npu = self._get_prefill_npu_id(stage, rank)
-                process_group = self._prefill_tp_pg(stage) if tp_size > 1 else None
+                npu = self._get_prefill_npu_id(stage, rank, dp_rank)
+                process_group = self._prefill_tp_pg(stage, dp_rank) if tp_size > 1 else None
 
                 #Receive the activations from the previous stage
                 if stage > 0:
-                    prev_stage_npu = npu - tp_size
-                    name=pp_name(pl="p", src_stage=stage-1, dst_stage=stage, sh=rank, it=0)
+                    prev_stage_npu = npu - stage_stride
+                    name=pp_name(pl="p", src_stage=stage-1, dst_stage=stage, sh=rank, it=0,
+                                 dp=self._dp_field(dp_rank, cfg))
                     recv_node = receive(
-                        sender=prev_stage_npu, receiver=npu, size=self.pp_prefill_bytes,
+                        sender=prev_stage_npu, receiver=npu, size=pp_bytes,
                         parents=[last_node_per_npu[npu]] if last_node_per_npu[npu] else None,
                         name=name, tag = comm_tag(name)
                     )
@@ -179,9 +265,12 @@ class DisaggregatedInference(Orchestrator):
                 for local_layer_idx in range(self.layer_per_stage_prefill):
                     global_layer_idx = (stage*self.layer_per_stage_prefill) + local_layer_idx
                     emit_result = self.prefill_model.prefill(
-                        name=comp_base(pl="p", ss=stage, sh=rank, L=global_layer_idx, it=0),
-                        npu_id=npu, layer=global_layer_idx, prompt_lens=self.prompt_lens, cached_lens=self.cached_lens,
-                        pg_name=process_group
+                        name=comp_base(pl="p", ss=stage, sh=rank, L=global_layer_idx, it=0,
+                                       dp=self._dp_field(dp_rank, cfg)),
+                        npu_id=npu, layer=global_layer_idx, prompt_lens=prompt_lens, cached_lens=cached_lens,
+                        pg_name=process_group, **self._moe_kwargs("p", stage, dp_rank, rank,
+                                                                 origin_tokens,
+                                                                 (PHASE_PREFILL, global_layer_idx))
                     )
                     if last_node_per_npu[npu]:
                         add_dependencies(emit_result.nodes[0], [last_node_per_npu[npu]])
@@ -190,11 +279,12 @@ class DisaggregatedInference(Orchestrator):
                     kv_ready_hooks[(global_layer_idx, npu)] = emit_result.kv_ready
 
                 # Send the activations to the next stage
-                if stage < self.prefill_cfg.pp_size - 1:
-                    next_stage_npu = npu + tp_size
-                    name=pp_name(pl="p", src_stage=stage, dst_stage=stage+1, sh=rank, it=0)
+                if stage < cfg.pp_size - 1:
+                    next_stage_npu = npu + stage_stride
+                    name=pp_name(pl="p", src_stage=stage, dst_stage=stage+1, sh=rank, it=0,
+                                 dp=self._dp_field(dp_rank, cfg))
                     send_node = send(
-                        sender=npu, receiver=next_stage_npu, size=self.pp_prefill_bytes,
+                        sender=npu, receiver=next_stage_npu, size=pp_bytes,
                         parents=[last_node_per_npu[npu]] if last_node_per_npu[npu] else None,
                         name=name, tag = comm_tag(name)
                     )
@@ -215,9 +305,11 @@ class DisaggregatedInference(Orchestrator):
         """Emit the streaming transfer of the KV cache for each layer as soon as it is ready in the prefill pool, overlapping communication with the rest of prefill (Splitwise approach)"""
         for layer in range(self.num_layers):
             for (src_npu, dst_npu, size) in self._kv_edges(layer):
-                ps, sr = self._get_prefill_coord(src_npu)
-                ds, dr = self._get_decode_coord(dst_npu)
-                name_kv = kv_name(src_stage=ps, dst_stage=ds, ssh=sr, dsh=dr, it=0, L=layer)
+                ps, sr, sdp = self._get_prefill_coord(src_npu)
+                ds, dr, ddp = self._get_decode_coord(dst_npu)
+                name_kv = kv_name(src_stage=ps, dst_stage=ds, ssh=sr, dsh=dr, it=0, L=layer,
+                                  sdp=self._dp_field(sdp, self.prefill_cfg),
+                                  ddp=self._dp_field(ddp, self.decode_cfg))
                 ready_hook = kv_ready_hooks[(layer, src_npu)]
                 recv_node = self._create_kv_transfer_pair(nodes, src_npu, dst_npu, size, ready_hook, name_kv)
                 self._stream_recv[(layer, dst_npu)].append(recv_node)
@@ -229,9 +321,11 @@ class DisaggregatedInference(Orchestrator):
             for (src_npu, dst_npu, size) in self._kv_edges(layer):
                 aggregated_bytes[(src_npu, dst_npu)] += size
         for (src_npu, dst_npu), size in aggregated_bytes.items():
-            ps, sr = self._get_prefill_coord(src_npu)
-            ds, dr = self._get_decode_coord(dst_npu)
-            name_kv = kv_name(src_stage=ps, dst_stage=ds, ssh=sr, dsh=dr, seg="all", it=0)
+            ps, sr, sdp = self._get_prefill_coord(src_npu)
+            ds, dr, ddp = self._get_decode_coord(dst_npu)
+            name_kv = kv_name(src_stage=ps, dst_stage=ds, ssh=sr, dsh=dr, seg="all", it=0,
+                              sdp=self._dp_field(sdp, self.prefill_cfg),
+                              ddp=self._dp_field(ddp, self.decode_cfg))
             ready_hook = last_node_per_npu[src_npu]
             recv_node = self._create_kv_transfer_pair(nodes, src_npu, dst_npu, size, ready_hook, name_kv)
             self._bulk_recv[dst_npu].append(recv_node)
@@ -266,55 +360,78 @@ class DisaggregatedInference(Orchestrator):
     # Second phase: emit the first token computed by the prefill
     # ------------------------------------------------------------------ #
     def _emit_first_token(self, nodes: Dict, last_node_per_npu: Dict) -> Dict:
-        """Causal handoff of the FIRST token: prefill last stage -> decode stage 0.
-        Transport only (token id, SAMPLE_BYTES). Mirrors the autoregressive feedback"""
+        """Causal handoff of the FIRST token: prefill last stage -> decode stage 0. Transport
+        only (token id, SAMPLE_BYTES), mirroring the autoregressive feedback.
+
+        Like the KV cache, the handoff follows the REQUESTS: a decode slice cannot start until
+        every prefill device that produced one of its first tokens has handed it over, so there
+        is one edge per (src_dp, dst_dp) pair whose slices intersect. Gating on a single device
+        would let a slice start while some of its requests had not been prefilled yet."""
         last_stage = self.prefill_cfg.pp_size - 1
-        tp_p = self.prefill_cfg.tp_size
-        token_recv_per_npu = {}
-        for dst_rank in range(self.decode_cfg.tp_size):
-            src_npu = self._get_prefill_npu_id(last_stage, dst_rank % tp_p)
-            dst_npu = self._get_decode_npu_id(0, dst_rank)
-            name= firsttok_name(src_stage=last_stage, dst_stage=0, dsh=dst_rank, it=0)
-            send_node = send(sender=src_npu, receiver=dst_npu, size=SAMPLE_BYTES,
-                            parents=[last_node_per_npu[src_npu]],
-                            name=name, tag=comm_tag(name)
-                            )
-            nodes[src_npu].append(send_node)
-            #last_node_per_npu[src_npu] = send_node
-            recv_node = receive(sender=src_npu, receiver=dst_npu, size=SAMPLE_BYTES,
-                                parents=None, name=name, tag=comm_tag(name)
-                                )
-            nodes[dst_npu].append(recv_node)
-            token_recv_per_npu[dst_npu] = recv_node
+        cfg_p, cfg_d = self.prefill_cfg, self.decode_cfg
+        token_recv_per_npu: Dict[int, List] = defaultdict(list)
+
+        for dst_dp in range(cfg_d.dp_size):
+            owned = self._slice(dst_dp, cfg_d.dp_size)
+            producers = sorted({self._owner(i, cfg_p.dp_size) for i in owned})
+            for src_dp in producers:
+                for dst_rank in range(cfg_d.tp_size):
+                    src_npu = self._get_prefill_npu_id(last_stage, dst_rank % cfg_p.tp_size, src_dp)
+                    dst_npu = self._get_decode_npu_id(0, dst_rank, dst_dp)
+                    name = firsttok_name(src_stage=last_stage, dst_stage=0, dsh=dst_rank, it=0,
+                                         sdp=self._dp_field(src_dp, cfg_p),
+                                         ddp=self._dp_field(dst_dp, cfg_d))
+                    send_node = send(sender=src_npu, receiver=dst_npu, size=SAMPLE_BYTES,
+                                     parents=[last_node_per_npu[src_npu]],
+                                     name=name, tag=comm_tag(name))
+                    nodes[src_npu].append(send_node)
+                    recv_node = receive(sender=src_npu, receiver=dst_npu, size=SAMPLE_BYTES,
+                                        parents=None, name=name, tag=comm_tag(name))
+                    nodes[dst_npu].append(recv_node)
+                    token_recv_per_npu[dst_npu].append(recv_node)
         return token_recv_per_npu
-    
+
     # ------------------------------------------------------------------ #
     # Fourth phase: decode
     # ------------------------------------------------------------------ #
     def _emit_decode(self, nodes: Dict, last_node_per_npu: Dict) -> None:
         """Emit a single PP traversal for one decode step. Each step processes exactly one new token; every layer reads a KV cache of length `kv_len`. """
-        tp_size = self.decode_cfg.tp_size
+        cfg = self.decode_cfg
+        tp_size, dp_size = cfg.tp_size, cfg.dp_size
+        stage_stride = tp_size * dp_size
         for npu in range(self.prefill_npus, self.total_npus):
             # Streaming overlaps KV *transfer* with prefill, but the first decode step is still gated by the first-token handoff (see _emit_first_token).
             # Done just for safety, not useful since prefill does not touch decode NPUs traces
             last_node_per_npu[npu] = None 
         
         for step in range(self.max_decode_steps):
-            active_requests = [i for i, req in enumerate(self.requests) if req.gen_len > step]
-            current_kv_lens = [self.requests[i].prompt_len + step + 1 for i in active_requests] # each active request has a KV cache length equal to its prompt length + number of decode steps already processed + 1 for the new token
-            active_batch_size = len(active_requests)
-            pp_decode_bytes = int(self.scale * active_batch_size * self.hidden_size * self.bytes_per_val)
+            for stage in range(cfg.pp_size):
+              for dp_rank in range(dp_size):
+                # a slice keeps only its own still-generating requests; a slice that runs dry
+                # still walks the whole schedule, which is what vLLM does with dummy forward
+                # passes so that the DP ranks stay in lockstep for the expert layers
+                active_requests = [i for i in self._slice(dp_rank, dp_size)
+                                   if self.requests[i].gen_len > step]
+                # KV length = prompt + steps already done + the token produced now
+                current_kv_lens = [self.requests[i].prompt_len + step + 1 for i in active_requests]
+                pp_decode_bytes = self._activation_bytes(len(active_requests))
+                origin_tokens = None
+                if self.moe:
+                    active_per_slice = [len([i for i in self._slice(dp, dp_size)
+                                             if self.requests[i].gen_len > step])
+                                        for dp in range(dp_size)]
+                    origin_tokens = self._origin_tokens("d", active_per_slice)
 
-            for stage in range(self.decode_cfg.pp_size):
                 for rank in range(tp_size):
-                    npu = self._get_decode_npu_id(stage, rank)
-                    process_group = self._decode_tp_pg(stage) if tp_size > 1 else None
+                    npu = self._get_decode_npu_id(stage, rank, dp_rank)
+                    process_group = self._decode_tp_pg(stage, dp_rank) if tp_size > 1 else None
 
                     #Receives the activations from the previous stage (or the KV cache for the first stage)
                     if stage > 0:
-                        name = pp_name(pl="d", src_stage=stage-1, dst_stage=stage, sh=rank, it=step)
+                        name = pp_name(pl="d", src_stage=stage-1, dst_stage=stage, sh=rank, it=step,
+                                       dp=self._dp_field(dp_rank, cfg))
                         recv_node = receive(
-                            sender=npu - tp_size, receiver=npu, size=pp_decode_bytes, 
+                            sender=npu - stage_stride, receiver=npu, size=pp_decode_bytes, 
                             parents=[last_node_per_npu[npu]] if last_node_per_npu[npu] else None,
                             name=name, tag=comm_tag(name)
                         )
@@ -325,8 +442,12 @@ class DisaggregatedInference(Orchestrator):
                     for local_layer_idx in range(self.layer_per_stage_decode):
                         global_layer_idx = stage*self.layer_per_stage_decode + local_layer_idx
                         emit_result = self.decode_model.decode(
-                            name=comp_base(pl="d", ss=stage, sh=rank, L=global_layer_idx, it=step),
-                            npu_id=npu, layer=global_layer_idx, kv_lens=current_kv_lens, pg_name=process_group
+                            name=comp_base(pl="d", ss=stage, sh=rank, L=global_layer_idx, it=step,
+                                           dp=self._dp_field(dp_rank, cfg)),
+                            npu_id=npu, layer=global_layer_idx, kv_lens=current_kv_lens,
+                            pg_name=process_group,
+                            **self._moe_kwargs("d", stage, dp_rank, rank, origin_tokens,
+                                               (PHASE_DECODE, step, global_layer_idx), step)
                         )
 
                         dependencies=[]
@@ -337,18 +458,19 @@ class DisaggregatedInference(Orchestrator):
                             dependencies += self._get_kv_arrival_dependencies(global_layer_idx, npu, local_layer_idx)
                             if local_layer_idx == 0:
                                 # The first layer of the first decode stage must also wait for the first token from prefill
-                                token_recv = self._first_token_recv.get(npu)
-                                if token_recv:
-                                    dependencies.append(token_recv)
+                                # every prefill device that produced one of this slice's
+                                # first tokens must have handed it over
+                                dependencies += self._first_token_recv.get(npu, [])
                         if dependencies:
                             add_dependencies(emit_result.nodes[0], dependencies)
                         
                         nodes[npu].extend(emit_result.nodes)
                         last_node_per_npu[npu] = emit_result.tail
                     
-                    if stage < self.decode_cfg.pp_size - 1:
-                        next_stage_npu = npu + tp_size
-                        name = pp_name(pl="d", src_stage=stage, dst_stage=stage+1, sh=rank, it=step)
+                    if stage < cfg.pp_size - 1:
+                        next_stage_npu = npu + stage_stride
+                        name = pp_name(pl="d", src_stage=stage, dst_stage=stage+1, sh=rank, it=step,
+                                       dp=self._dp_field(dp_rank, cfg))
                         send_node = send(
                             sender=npu, receiver=next_stage_npu, size=pp_decode_bytes, 
                             parents=[last_node_per_npu[npu]] if last_node_per_npu[npu] else None,
@@ -367,11 +489,13 @@ class DisaggregatedInference(Orchestrator):
             # With pp_d == 1 the per-NPU chain already serialises steps, so this is only needed for pp_d > 1.
             return
         
-        tp_size = self.decode_cfg.tp_size
-        for rank in range(tp_size):
-            src_npu = self._get_decode_npu_id(self.decode_cfg.pp_size - 1, rank)
-            dst_npu = self._get_decode_npu_id(0, rank)
-            name = decfb_name(pl="d", src_stage=self.decode_cfg.pp_size - 1, dst_stage=0, sh=rank, it=step)
+        cfg = self.decode_cfg
+        for dp_rank in range(cfg.dp_size):
+          for rank in range(cfg.tp_size):
+            src_npu = self._get_decode_npu_id(cfg.pp_size - 1, rank, dp_rank)
+            dst_npu = self._get_decode_npu_id(0, rank, dp_rank)
+            name = decfb_name(pl="d", src_stage=cfg.pp_size - 1, dst_stage=0, sh=rank, it=step,
+                              dp=self._dp_field(dp_rank, cfg))
 
             send_node = send(
                 sender=src_npu, receiver=dst_npu, size=SAMPLE_BYTES, 
