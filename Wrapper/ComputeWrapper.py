@@ -15,7 +15,7 @@
 
 from typing import List, Optional, Tuple
 
-from Wrapper.Interfaces import BaseWrapper
+from mlsynth.Wrapper.Wrapper import BaseWrapper
 from mlsynth.Layer.Layer import LayerEmission
 from Utils.config import ParallelismConfig, WrapperCondition, WrapperConfig
 from Utils.nodes import attr_val, compute
