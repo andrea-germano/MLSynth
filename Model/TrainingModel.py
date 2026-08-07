@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from mlsynth.Model.Model import BaseTrainingModel
+from Model.Model import BaseTrainingModel
 from Layer.TrainingLayer import TrainingLayer
 from Utils.config import TrainRunConfig
 from chakra.schema.protobuf.et_def_pb2 import (
@@ -40,10 +40,11 @@ class TrainingModel(BaseTrainingModel):
             for _ in range(run.model.num_layers)
         ]
 
-    def fwd(self, name, npu_id, layer, num_batches, pg_name=None) -> list[ChakraNode]:
+    def fwd(self, name, npu_id, layer, num_batches, pg_name=None, microbatch=0, ep_ctx=None) -> list[ChakraNode]:
+        # microbatch/ep_ctx belong to the BaseTrainingModel signature; a dense model has no use for them
         return self._layer_for(layer).fwd(name=name, num_batches=num_batches, pg_name=pg_name)
 
-    def bckwd(self, name, npu_id, layer, num_batches, pg_name=None) -> list[ChakraNode]:
+    def bckwd(self, name, npu_id, layer, num_batches, pg_name=None, microbatch=0, ep_ctx=None) -> list[ChakraNode]:
         return self._layer_for(layer).bckwd(name=name, num_batches=num_batches, pg_name=pg_name)
 
     def _layer_for(self, idx: int) -> TrainingLayer:

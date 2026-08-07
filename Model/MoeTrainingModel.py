@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from mlsynth.Model.Model import BaseTrainingModel
-from mlsynth.Layer.Layer import MoeEpContext
+from Model.Model import BaseTrainingModel
+from Layer.Layer import MoeEpContext
 from Layer.MoeTrainingLayer import MoeTrainingLayer
 from Utils.config import TrainRunConfig
 from Utils.routing import RoutingPlan

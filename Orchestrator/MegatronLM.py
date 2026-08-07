@@ -14,10 +14,10 @@
 # limitations under the License.
 
 from collections import defaultdict
-from mlsynth.Orchestrator.Orchestrator import Orchestrator
+from Orchestrator.Orchestrator import Orchestrator
 from Utils.config import TrainRunConfig
 from Utils.nodes import add_dependencies, allreduce, receive, send
-from mlsynth.Layer.Layer import MoeEpContext
+from Layer.Layer import MoeEpContext
 from chakra.schema.protobuf.et_def_pb2 import (GlobalMetadata)
 
 
@@ -52,8 +52,8 @@ class MegatronLM(Orchestrator):
         flat = self._flat(dp_group, tp_shard)
         cluster, ep_rank = divmod(flat, self.ep_size)
         return MoeEpContext(peers=self._cluster_peers(cluster, pp_stage),
-                            ep_rank=ep_rank, cluster=cluster, stage=pp_stage,
-                            pg_name=self._ep_pg_name(cluster, pp_stage))
+                            ep_rank=ep_rank, cluster=cluster, clusters=self.edp_size,
+                            stage=pp_stage, pg_name=self._ep_pg_name(cluster, pp_stage))
 
     def _cluster_peers(self, cluster: int, pp_stage: int) -> list[int]:
         """npu_ids of one EP cluster, ordered by their position in it."""

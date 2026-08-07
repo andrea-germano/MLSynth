@@ -15,8 +15,8 @@
 
 from typing import List, Optional, Tuple
 
-from mlsynth.Wrapper.Wrapper import BaseWrapper
-from mlsynth.Layer.Layer import LayerEmission
+from Wrapper.Wrapper import BaseWrapper
+from Layer.Layer import LayerEmission
 from Utils.config import ParallelismConfig, WrapperCondition, WrapperConfig
 from Utils.nodes import attr_val, compute
 from chakra.schema.protobuf.et_def_pb2 import (
@@ -59,15 +59,15 @@ class ComputeWrapper(BaseWrapper):
 
     # ------------- inference -------------
 
-    def prefill(self, name, npu_id, layer, prompt_lens, cached_lens, pg_name=None) -> LayerEmission:
-        emission = self.model.prefill(name, npu_id, layer, prompt_lens, cached_lens, pg_name)
+    def prefill(self, name, npu_id, layer, prompt_lens, cached_lens, pg_name=None, **moe_kwargs) -> LayerEmission:
+        emission = self.model.prefill(name, npu_id, layer, prompt_lens, cached_lens, pg_name, **moe_kwargs)
         condition = self.should_slowdown(npu_id, layer)
         if condition and condition.applies_to("prefill"):
             emission = self._apply_to_emission(emission, self._slowdown_factor(condition))
         return emission
 
-    def decode(self, name, npu_id, layer, kv_lens, pg_name=None) -> LayerEmission:
-        emission = self.model.decode(name, npu_id, layer, kv_lens, pg_name)
+    def decode(self, name, npu_id, layer, kv_lens, pg_name=None, **moe_kwargs) -> LayerEmission:
+        emission = self.model.decode(name, npu_id, layer, kv_lens, pg_name, **moe_kwargs)
         condition = self.should_slowdown(npu_id, layer)
         if condition and condition.applies_to("decode"):
             emission = self._apply_to_emission(emission, self._slowdown_factor(condition))
