@@ -23,9 +23,8 @@ from chakra.schema.protobuf.et_def_pb2 import (
 
 
 class TrainingLayer(BaseTrainingLayer):
-    """A single dense training block. The cost model lives in DenseBlockMath (shared with the
-    inference layer); the backward pass is modeled as 2x the forward FLOPs, emitted in reverse
-    order (FFN first, then attention). Attention scores are not halved for causal masking."""
+    """A single dense training block. The cost model lives in DenseBlockMath, shared with the
+    inference layer; the backward is 2x the forward FLOPs, in reverse order."""
 
     def __init__(self, model_cfg: ModelConfig, sequence_len: int, tp_size: int):
         self.math = DenseBlockMath.from_model_cfg(model_cfg, tp_size)

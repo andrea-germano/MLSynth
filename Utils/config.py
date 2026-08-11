@@ -46,6 +46,10 @@ class MoeConfig:
     """Mixture-of-experts configuration for training and inference"""
     num_experts: int
     top_k: int = 1 #dispatch volume per token, default is 1
+    # Training only: the expert buffers are sized for this multiple of the average load, and
+    # that fixed capacity is what sizes the all-to-all (the training block has no router).
+    # Inference ignores it: there the volume comes from the sampled routing itself.
+    capacity_factor: float = 1.25
 
 @dataclass(frozen=True)
 class MoeRoutingConfig:
@@ -69,9 +73,10 @@ class ParallelismConfig:
     kept WHOLE (etp = 1), so ep can span up to the full stage:
       - default: ep = tp*dp (one cluster, no expert replicas) — vLLM serving behaviour, and
         Megatron-Core's ETP=1 folding used for fine-grained MoEs;
-      - training may set ep_size < tp*dp to replicate experts over edp = tp*dp/ep clusters,
-        which adds the expert-DP gradient all-reduce (Megatron's expert-data-parallelism);
-      - inference rejects ep_size < tp*dp (EPLB-style redundancy is not modelled).
+      - inference rejects ep_size < tp*dp (EPLB-style redundancy is not modelled);
+      - TRAINING only reads ep as an on/off switch for the all-to-all, which is the original's
+        behaviour: there is no expert mesh, no expert-DP group and no per-device expert count,
+        so ep_size < tp*dp parses and validates but changes nothing in the emitted trace.
     Megatron-Core's other mode (ETP = tp, experts sharded by tensor rank) is NOT modelled.
     DP in inference is only meaningful for MoE models, for dense models it would only produce independent replicas with identical traces, so it is rejected there"""
     tp_size: int = 1
@@ -127,7 +132,8 @@ class WrapperCondition:
     """Selects the (npu, layer, phase) combinations a slowdown applies to. Unset fields match everything.
 
     npu_id/npu_id_range refer to the GLOBAL NPU id, with the same semantics in both modes:
-    - training (MegatronLM): npu_id = dp_group*(pp_size*tp_size) + pp_stage*tp_size + tp_shard
+    - training (MegatronLM): npu_id = pp_stage*(dp_size*tp_size) + dp_group*tp_size + tp_shard
+      (Megatron rank order tp-dp-pp: each pipeline stage is a contiguous block)
     - inference (DisaggregatedInference): the prefill pool occupies ids [0, prefill_npus),
       the decode pool ids [prefill_npus, prefill_npus + decode_npus)
     layer_id/layer_id_range refer to the global layer index in both modes."""
@@ -191,7 +197,6 @@ class TrainRunConfig:
     parallelism: ParallelismConfig
     training: TrainingConfig
     wrapper: WrapperConfig | None = None
-    moe_routing: MoeRoutingConfig | None = None
 
     @staticmethod
     def from_yaml(path: str | Path) -> TrainRunConfig:
@@ -203,11 +208,13 @@ class TrainRunConfig:
         _require(data, ("model", "training", "parallelism"), ctx="root")
 
         model = _build_model(data["model"])
-        routing = _build_moe_routing(data.get("moe_routing"), model)
+        if data.get("moe_routing"):
+            raise ValueError("moe_routing is inference-only: the training block sizes its "
+                             "all-to-all from model.moe.capacity_factor, with no router.")
         parallelism = _build_parallelism_block(data["parallelism"], model, "parallelism", inference=False)
         training = _build_training(data["training"], parallelism)
         wrapper = _build_wrapper(data.get("wrapper"))
-        return TrainRunConfig(model=model, parallelism=parallelism, training=training, wrapper=wrapper, moe_routing=routing)
+        return TrainRunConfig(model=model, parallelism=parallelism, training=training, wrapper=wrapper)
 
 def _build_model(data: dict) -> ModelConfig:
     _require(data, ("name", "num_layers", "hidden_size", "vocab_size", "bytes_per_val"), ctx="model")
@@ -244,11 +251,14 @@ def _build_moe(data: dict | None) -> MoeConfig | None:
     if data is None:
         return None
     _require(data, ("num_experts",), ctx="model.moe")
-    cfg = MoeConfig(num_experts=int(data["num_experts"]), top_k=int(data.get("top_k", 1)))
+    cfg = MoeConfig(num_experts=int(data["num_experts"]), top_k=int(data.get("top_k", 1)),
+                    capacity_factor=float(data.get("capacity_factor", 1.25)))
     if cfg.num_experts < 2:
         raise ValueError("model.moe: num_experts must be >= 2 (a 1-expert MoE is a dense model)")
     if not (1 <= cfg.top_k <= cfg.num_experts):
         raise ValueError(f"model.moe: top_k must be in [1, num_experts], got {cfg.top_k}")
+    if cfg.capacity_factor <= 0:
+        raise ValueError("model.moe: capacity_factor must be > 0")
     return cfg
 
 def _build_moe_routing(data: dict | None, model: ModelConfig) -> MoeRoutingConfig | None:

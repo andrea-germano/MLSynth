@@ -22,15 +22,13 @@ from chakra.schema.protobuf.et_def_pb2 import (
 
 
 class TrainingModel(BaseTrainingModel):
-    """Dense transformer model for training. The orchestrator fetches per-layer
-    computation and communication operations through fwd/bckwd."""
+    """Dense transformer model for training."""
 
     def __init__(self, run: TrainRunConfig):
         self._model_cfg = run.model
         self._training = run.training
         self._tp_size = run.parallelism.tp_size
 
-        # Model is composed of Transformer layers, one instance per layer
         self.layers = [
             TrainingLayer(
                 model_cfg=run.model,
@@ -41,7 +39,6 @@ class TrainingModel(BaseTrainingModel):
         ]
 
     def fwd(self, name, npu_id, layer, num_batches, pg_name=None, microbatch=0, ep_ctx=None) -> list[ChakraNode]:
-        # microbatch/ep_ctx belong to the BaseTrainingModel signature; a dense model has no use for them
         return self._layer_for(layer).fwd(name=name, num_batches=num_batches, pg_name=pg_name)
 
     def bckwd(self, name, npu_id, layer, num_batches, pg_name=None, microbatch=0, ep_ctx=None) -> list[ChakraNode]:

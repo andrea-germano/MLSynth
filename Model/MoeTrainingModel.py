@@ -14,10 +14,8 @@
 # limitations under the License.
 
 from Model.Model import BaseTrainingModel
-from Layer.Layer import MoeEpContext
 from Layer.MoeTrainingLayer import MoeTrainingLayer
 from Utils.config import TrainRunConfig
-from Utils.routing import RoutingPlan
 from chakra.schema.protobuf.et_def_pb2 import (
     Node as ChakraNode,
 )
@@ -30,33 +28,25 @@ class MoeTrainingModel(BaseTrainingModel):
         self._model_cfg = run.model
         self._training = run.training
         self._tp_size = run.parallelism.tp_size
-        self._ep_size = run.parallelism.ep
-        self._edp_size = run.parallelism.edp
         self.moe = run.model.moe
-        # one plan shared by every layer: it holds the per-layer popularity vectors and the
-        # matrix cache, and every rank rebuilds identical matrices from the seeded RNG
-        self.plan = RoutingPlan(self.moe, run.moe_routing)
 
         self.layers = [
             MoeTrainingLayer(
                 model_cfg=run.model,
                 sequence_len=run.training.sequence_len,
                 tp_size=run.parallelism.tp_size,
-                plan=self.plan,
-                layer_idx=idx,
+                ep_size=run.parallelism.ep,
             )
-            for idx in range(run.model.num_layers)
+            for _ in range(run.model.num_layers)
         ]
 
     def fwd(self, name, npu_id, layer, num_batches, pg_name=None, microbatch: int = 0,
-            ep_ctx: MoeEpContext | None = None) -> list[ChakraNode]:
-        return self._layer_for(layer).fwd(name=name, num_batches=num_batches, pg_name=pg_name,
-                                          ep_ctx=ep_ctx, microbatch=microbatch)
+            ep_ctx=None) -> list[ChakraNode]:
+        return self._layer_for(layer).fwd(name=name, num_batches=num_batches, pg_name=pg_name)
 
     def bckwd(self, name, npu_id, layer, num_batches, pg_name=None, microbatch: int = 0,
-              ep_ctx: MoeEpContext | None = None) -> list[ChakraNode]:
-        return self._layer_for(layer).bckwd(name=name, num_batches=num_batches, pg_name=pg_name,
-                                            ep_ctx=ep_ctx, microbatch=microbatch)
+              ep_ctx=None) -> list[ChakraNode]:
+        return self._layer_for(layer).bckwd(name=name, num_batches=num_batches, pg_name=pg_name)
 
     def _layer_for(self, idx: int) -> MoeTrainingLayer:
         return self.layers[idx]
@@ -70,28 +60,19 @@ class MoeTrainingModel(BaseTrainingModel):
 
     @property
     def expert_params(self) -> float:
-        """FFN weights of every expert, over all layers (the whole model, not the local shard)."""
+        """FFN weights of every expert, over all layers."""
         return float(sum(layer.math.ffn_weight_elems for layer in self.layers) * self.moe.num_experts)
 
     @property
     def num_params(self) -> float:
+        """Counted, not approximated, and the experts are in it: the whole model goes through
+        the single DP all-reduce, since no expert-DP group is modelled."""
         d, L, V = self._model_cfg.hidden_size, self._model_cfg.num_layers, self._model_cfg.vocab_size
         attn_weights = sum(layer.math.attn_weight_elems for layer in self.layers)
         router = L * d * self.moe.num_experts
         embedding = 2 * V * d  # embedding + lm head
         norms = (2 * L + 1) * d
         return float(attn_weights + router + embedding + norms) + self.expert_params
-
-    @property
-    def dp_sync_params(self) -> float:
-        """Parameters carried by the DP all-reduce: the non-expert ones. Expert gradients live
-        on the expert-DP group instead (and stay local when edp == 1)."""
-        return self.num_params - self.expert_params
-
-    @property
-    def expert_sync_params(self) -> float:
-        """Expert parameters per rank, all-reduced over the expert-DP group when edp > 1."""
-        return self.expert_params / self._ep_size if self._edp_size > 1 else 0.0
 
     def get_num_params(self) -> float:
         return self.num_params

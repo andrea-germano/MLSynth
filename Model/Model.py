@@ -25,14 +25,10 @@ class BaseTrainingModel(ABC):
         raise NotImplementedError
 
     @property
-    def dp_sync_params(self) -> float:
-        """Parameters carried by the DP all-reduce. Equals num_params for dense models; MoE models override it to exclude the expert weights, which are reduced separately."""
-        return self.num_params
-
-    @property
-    def expert_sync_params(self) -> float:
-        """Parameters carried by the expert-DP all-reduce: none unless the model has replicated experts (edp > 1), which only MoE models can have."""
-        return 0.0
+    @abstractmethod
+    def num_params(self) -> float:
+        """Whole-model parameter count. Sizes the DP gradient all-reduce."""
+        raise NotImplementedError
 
 
 class BaseInferenceModel(ABC):
