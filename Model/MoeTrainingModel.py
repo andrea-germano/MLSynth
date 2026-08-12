@@ -40,12 +40,10 @@ class MoeTrainingModel(BaseTrainingModel):
             for _ in range(run.model.num_layers)
         ]
 
-    def fwd(self, name, npu_id, layer, num_batches, pg_name=None, microbatch: int = 0,
-            ep_ctx=None) -> list[ChakraNode]:
+    def fwd(self, name, npu_id, layer, num_batches, pg_name=None, microbatch: int = 0) -> list[ChakraNode]:
         return self._layer_for(layer).fwd(name=name, num_batches=num_batches, pg_name=pg_name)
 
-    def bckwd(self, name, npu_id, layer, num_batches, pg_name=None, microbatch: int = 0,
-              ep_ctx=None) -> list[ChakraNode]:
+    def bckwd(self, name, npu_id, layer, num_batches, pg_name=None, microbatch: int = 0) -> list[ChakraNode]:
         return self._layer_for(layer).bckwd(name=name, num_batches=num_batches, pg_name=pg_name)
 
     def _layer_for(self, idx: int) -> MoeTrainingLayer:

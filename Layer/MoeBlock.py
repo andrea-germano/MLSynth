@@ -93,7 +93,7 @@ class MoeBlock:
             return []
 
         def edge_name(src_ep, dst_ep):
-            return a2a_name(pl=ep_ctx.pool, op=op, stage=ep_ctx.stage, se=src_ep, de=dst_ep, L=self.layer_idx, it=it,cl=ep_ctx.cluster if ep_ctx.clusters > 1 else None)
+            return a2a_name(pl=ep_ctx.pool, op=op, stage=ep_ctx.stage, se=src_ep, de=dst_ep, L=self.layer_idx, it=it)
 
         emitted, recvs = alltoall_v(matrix, ep_ctx.peers, ep_ctx.ep_rank, parents=parents, size_for=self.edge_bytes, name_for=edge_name)
         nodes.extend(emitted)

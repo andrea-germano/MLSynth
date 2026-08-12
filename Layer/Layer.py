@@ -16,13 +16,11 @@ class LayerEmission:
 
 @dataclass(frozen=True)
 class MoeEpContext:
-    """The expert-parallel group an MoE layer emits its all-to-all over"""
-    peers: List[int]    # npu_ids of this cluster; index i == EP rank i == row/col i of the matrix
+    """The expert-parallel group an MoE layer emits its all-to-all over. INFERENCE ONLY"""
+    peers: List[int]    # npu_ids of the group; index i == EP rank i == row/col i of the matrix
     ep_rank: int        # this device's position in `peers`, i.e. its row/column in the matrix
-    cluster: int = 0    # which expert-weight replica this device belongs to (0 .. edp-1)
-    clusters: int = 1   # how many expert-weight replicas exist (edp); disambiguates a2a names when > 1
-    stage: int = 0      # this device's pipeline stage (naming only)
-    pool: str = "t"     # "p"/"d" for the inference pools, "t" for training (naming only)
+    stage: int          # this device's pipeline stage (naming only)
+    pool: str           # "p" or "d", the inference pool this device belongs to (naming only)
     origin_tokens: List[int] | None = None  # tokens each peer routes; None = every peer routes the caller's local count
 
     @property

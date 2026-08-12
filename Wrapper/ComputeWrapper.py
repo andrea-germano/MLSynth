@@ -43,15 +43,15 @@ class ComputeWrapper(BaseWrapper):
 
     # ------------- training -------------
 
-    def fwd(self, name, npu_id, layer, num_batches, pg_name=None, microbatch: int = 0, ep_ctx=None) -> list[ChakraNode]:
-        ops = self.model.fwd(name, npu_id, layer, num_batches, pg_name, microbatch=microbatch, ep_ctx=ep_ctx)
+    def fwd(self, name, npu_id, layer, num_batches, pg_name=None, microbatch: int = 0) -> list[ChakraNode]:
+        ops = self.model.fwd(name, npu_id, layer, num_batches, pg_name, microbatch=microbatch)
         condition = self.should_slowdown(npu_id, layer)
         if condition and condition.applies_to("forward"):
             ops, _ = self._insert_slowdown(ops, self._slowdown_factor(condition))
         return ops
 
-    def bckwd(self, name, npu_id, layer, num_batches, pg_name=None, microbatch: int = 0, ep_ctx=None) -> list[ChakraNode]:
-        ops = self.model.bckwd(name, npu_id, layer, num_batches, pg_name, microbatch=microbatch, ep_ctx=ep_ctx)
+    def bckwd(self, name, npu_id, layer, num_batches, pg_name=None, microbatch: int = 0) -> list[ChakraNode]:
+        ops = self.model.bckwd(name, npu_id, layer, num_batches, pg_name, microbatch=microbatch)
         condition = self.should_slowdown(npu_id, layer)
         if condition and condition.applies_to("backward"):
             ops, _ = self._insert_slowdown(ops, self._slowdown_factor(condition))

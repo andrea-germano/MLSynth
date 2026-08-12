@@ -114,33 +114,22 @@ class DisaggregatedInference(Orchestrator):
         """dp coordinate for a node name, omitted when there is a single slice so that dense traces keep their original names."""
         return dp_rank if cfg.dp_size > 1 else None
 
-    def _ep_context(self, pool: str, stage: int, dp_rank: int, tp_rank: int,
-                    origin_tokens: List[int]) -> MoeEpContext:
-        """The expert-parallel group of one device: every device of its pipeline stage, since in
-        serving ep = tp * dp with whole experts (etp = 1, edp = 1)"""
+    def _moe_kwargs(self, pool: str, stage: int, dp_rank: int, tp_rank: int, origin_tokens: List[int], layer: int, step: int = 0) -> dict:
+        """Everything only the MoE layers need, EMPTY for a dense model so that the dense call
+        site stays exactly as it was"""
+        if not self.moe:
+            return {}
         cfg = self.prefill_cfg if pool == "p" else self.decode_cfg
         npu_of = self._get_prefill_npu_id if pool == "p" else self._get_decode_npu_id
         peers = [npu_of(stage, tp, dp)
                  for dp in range(cfg.dp_size) for tp in range(cfg.tp_size)]
-        return MoeEpContext(peers=peers, ep_rank=dp_rank * cfg.tp_size + tp_rank, cluster=0,
-                            stage=stage, pool=pool, origin_tokens=origin_tokens)
-
-    def _moe_kwargs(self, pool: str, stage: int, dp_rank: int, tp_rank: int,
-                    origin_tokens, key: tuple, step: int = 0) -> dict:
-        """Extra arguments the MoE layers need; empty for a dense model, so the dense call site
-        is unchanged."""
-        if not self.moe:
-            return {}
-        return {"ep_ctx": self._ep_context(pool, stage, dp_rank, tp_rank, origin_tokens),
+        key = (PHASE_PREFILL, layer) if pool == "p" else (PHASE_DECODE, step, layer)
+        return {"ep_ctx": MoeEpContext(peers=peers, ep_rank=dp_rank * cfg.tp_size + tp_rank,
+                                       stage=stage, pool=pool, origin_tokens=origin_tokens),
                 "key": key, "step": step}
 
     def _origin_tokens(self, pool: str, tokens_per_slice: List[int]) -> List[int]:
-        """Tokens owned by each device of a stage: a slice's tokens are split across its tp
-        ranks so each token enters the all-to-all exactly once (vLLM's sequence-parallel MoE
-        dispatch, `use_sequence_parallel_moe`, active when EP is on with tp>1 AND dp>1). The
-        remainder goes to the lowest tp ranks so that no token is dropped when the slice is
-        smaller than tp (the decode regime). With dp=1 and tp>1 the split still feeds the
-        routing matrix, but the layer emits the masked no-a2a path (see MoeInferenceLayer)."""
+        """Tokens owned by each device of a stage: a slice's tokens are split across its tp ranks so each token enters the all-to-all exactly once"""
         cfg = self.prefill_cfg if pool == "p" else self.decode_cfg
         return [tokens_per_slice[dp] // cfg.tp_size + (tp < tokens_per_slice[dp] % cfg.tp_size)
                 for dp in range(cfg.dp_size) for tp in range(cfg.tp_size)]
@@ -281,9 +270,7 @@ class DisaggregatedInference(Orchestrator):
                         name=comp_base(pl="p", ss=stage, sh=rank, L=global_layer_idx, it=0,
                                        dp=self._dp_field(dp_rank, cfg)),
                         npu_id=npu, layer=global_layer_idx, prompt_lens=prompt_lens, cached_lens=cached_lens,
-                        pg_name=process_group, **self._moe_kwargs("p", stage, dp_rank, rank,
-                                                                 origin_tokens,
-                                                                 (PHASE_PREFILL, global_layer_idx))
+                        pg_name=process_group, **self._moe_kwargs("p", stage, dp_rank, rank, origin_tokens, global_layer_idx)
                     )
                     if last_node_per_npu[npu]:
                         add_dependencies(emit_result.nodes[0], self._deps(last_node_per_npu, npu))
@@ -461,8 +448,7 @@ class DisaggregatedInference(Orchestrator):
                                            dp=self._dp_field(dp_rank, cfg)),
                             npu_id=npu, layer=global_layer_idx, kv_lens=current_kv_lens,
                             pg_name=process_group,
-                            **self._moe_kwargs("d", stage, dp_rank, rank, origin_tokens,
-                                               (PHASE_DECODE, step, global_layer_idx), step)
+                            **self._moe_kwargs("d", stage, dp_rank, rank, origin_tokens, global_layer_idx, step)
                         )
 
                         dependencies=[]

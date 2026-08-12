@@ -3,7 +3,7 @@ from abc import ABC, abstractmethod
 from typing import List
 from chakra.schema.protobuf.et_def_pb2 import Node as ChakraNode
 
-from Layer.Layer import LayerEmission, MoeEpContext
+from Layer.Layer import LayerEmission
 from Utils.config import ModelConfig, ParallelismConfig
 
 
@@ -15,12 +15,12 @@ class BaseTrainingModel(ABC):
     consumed by wrappers (e.g. per-NPU slowdowns)."""
 
     @abstractmethod
-    def fwd(self, name: str, npu_id: int, layer: int, num_batches: float, pg_name: str | None = None, microbatch: int = 0, ep_ctx: MoeEpContext | None = None) -> List[ChakraNode]:
+    def fwd(self, name: str, npu_id: int, layer: int, num_batches: float, pg_name: str | None = None, microbatch: int = 0) -> List[ChakraNode]:
         """Return forward-pass operations for the given layer and microbatch count"""
         raise NotImplementedError
 
     @abstractmethod
-    def bckwd(self, name: str, npu_id: int, layer: int, num_batches: float, pg_name: str | None = None, microbatch: int = 0, ep_ctx: MoeEpContext | None = None) -> List[ChakraNode]:
+    def bckwd(self, name: str, npu_id: int, layer: int, num_batches: float, pg_name: str | None = None, microbatch: int = 0) -> List[ChakraNode]:
         """Return backward-pass operations for the given layer and microbatch count."""
         raise NotImplementedError
 

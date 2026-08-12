@@ -10,7 +10,6 @@ _ORDER = ("pl", # stands for pool --> prefill (p) or decode (d), or training (t)
            "ddp", # stands for dst dp slice (for kv/firsttok, where src and dst differ)
            "ssh", # stands for src tp shard id (for kv, where src and dst differ)
            "dsh", # stands for dst tp shard id (for kv, where src and dst differ)
-           "cl", # stands for EP cluster (which expert-weight replica the a2a belongs to)
            "se", # stands for src EP rank
            "de", # stands for dst EP rank 
            "L", # stands for layer
@@ -59,9 +58,9 @@ def coll_name(base: str, op: str) -> str:
 def pp_name(*, pl, src_stage, dst_stage, sh, it, dp=None) -> str:
     return _assemble("PP", dict(pl=pl, ss=src_stage, ds=dst_stage, sh=sh, dp=dp, it=it))
 
-def a2a_name(*, pl, op, stage, se, de, L, it, cl=None) -> str:
+def a2a_name(*, pl, op, stage, se, de, L, it) -> str:
     """MoE dispatch/combine edge. Identical on the SEND and the RECV of the same oriented edge"""
-    return _assemble("A2A", dict(pl=pl, ss=stage, cl=cl, se=se, de=de, L=L, op=op, it=it))
+    return _assemble("A2A", dict(pl=pl, ss=stage, se=se, de=de, L=L, op=op, it=it))
 
 def kv_name(*, src_stage, dst_stage, ssh, dsh, it, L=None, seg=None, se=None, de=None, sdp=None, ddp=None) -> str:
     return _assemble("KV", dict(ss=src_stage, ds=dst_stage, sdp=sdp, ddp=ddp, ssh=ssh, dsh=dsh, se=se, de=de, L=L, seg=seg, it=it))
