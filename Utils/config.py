@@ -58,8 +58,7 @@ class MoeRoutingConfig:
     reactive, so routing is realised by sampling at synthesis time with a dedicated seed"""
     distribution: str = "dirichlet"   # dirichlet | uniform
     alpha: float = 1.0  # dirichlet concentration; small = skewed
-    seed: int = 0 
-    dispatch: str = "p2p" # p2p | collective (means a native all to all communication, collective requires uniform)
+    seed: int = 0
 
     @property
     def is_uniform(self) -> bool:
@@ -69,15 +68,9 @@ class MoeRoutingConfig:
 class ParallelismConfig:
     """Tensor-, pipeline- and data-parallel degrees. Shared by training and inference.
 
-    Expert mesh (MoE Parallel Folding over the tp*dp devices of a stage): experts are always
-    kept WHOLE (etp = 1), so ep can span up to the full stage:
-      - default: ep = tp*dp (one cluster, no expert replicas) — vLLM serving behaviour, and
-        Megatron-Core's ETP=1 folding used for fine-grained MoEs;
-      - inference rejects ep_size < tp*dp (EPLB-style redundancy is not modelled);
-      - TRAINING only reads ep as an on/off switch for the all-to-all, which is the original's
-        behaviour: there is no expert mesh, no expert-DP group and no per-device expert count,
-        so ep_size < tp*dp parses and validates but changes nothing in the emitted trace.
-    Megatron-Core's other mode (ETP = tp, experts sharded by tensor rank) is NOT modelled.
+    Expert mesh (MoE Parallel Folding over the tp*dp devices of a stage): experts are always kept WHOLE (etp = 1) and ep spans the full stage:
+      - INFERENCE always derives ep = tp*dp (one cluster, no expert replicas)
+      - TRAINING accepts ep_size as an on/off switch for the all-to-all, which is the original's behaviour
     DP in inference is only meaningful for MoE models, for dense models it would only produce independent replicas with identical traces, so it is rejected there"""
     tp_size: int = 1
     pp_size: int = 1
@@ -184,10 +177,12 @@ class InferenceRunConfig:
 
         model = _build_model(data["model"])
         routing = _build_moe_routing(data.get("moe_routing"), model)
-        if routing is not None and routing.dispatch == "collective":
-            raise ValueError("Inference does not support collective all-to-all dispatch, only p2p")
         prefill, decode = _build_inference_parallelism(data, model)
         inference = _build_inference(data["inference"])
+        for label, cfg in (("prefill", prefill), ("decode", decode)):
+            # a dp slice with zero requests would prefill 0 tokens
+            if cfg.dp_size > len(inference.requests):
+                raise ValueError(f"{label}: dp_size ({cfg.dp_size}) exceeds the number of requests ({len(inference.requests)})")
         wrapper = _build_wrapper(data.get("wrapper"))
         return InferenceRunConfig(model=model, prefill=prefill, decode=decode, inference=inference, wrapper=wrapper, moe_routing=routing)
 
@@ -271,16 +266,11 @@ def _build_moe_routing(data: dict | None, model: ModelConfig) -> MoeRoutingConfi
         distribution=str(data.get("distribution", "dirichlet")).lower(),
         alpha=float(data.get("alpha", 1.0)),
         seed=int(data.get("seed", 0)),
-        dispatch=str(data.get("dispatch", "p2p")).lower(),
     )
     if cfg.distribution not in ("dirichlet", "uniform"):
         raise ValueError(f"moe_routing: distribution must be dirichlet/uniform, got {cfg.distribution!r}")
     if cfg.alpha <= 0:
         raise ValueError("moe_routing: alpha must be > 0")
-    if cfg.dispatch not in ("p2p", "collective"):
-        raise ValueError(f"moe_routing: dispatch must be p2p/collective, got {cfg.dispatch!r}")
-    if cfg.dispatch == "collective" and not cfg.is_uniform:
-        raise ValueError("moe_routing: dispatch=collective requires distribution=uniform")
     return cfg
 
 def load_config(path: str | Path):
@@ -316,16 +306,15 @@ def _build_parallelism_block(block: dict, model: ModelConfig, label: str,
     tp = int(block.get("tp_size", 1))
     pp = int(block.get("pp_size", 1))
     dp = int(block.get("dp_size", 1))
+    if inference and "ep_size" in block:
+        raise ValueError(f"{label}: ep is always derived as tp*dp (vLLM's EP flattening, whole experts) and cannot be set in inference.")
     ep = int(block.get("ep_size", 0))
     if dp < 1 or tp < 1 or pp < 1:
         raise ValueError(f"{label}: tp_size/pp_size/dp_size must be >= 1.")
     if ep and model.moe is None:
         raise ValueError(f"{label}: ep_size requires a model.moe block.")
     if inference and dp != 1 and model.moe is None:
-        # vLLM applies the same rule: --data-parallel-* options are MoE-only, since dense DP replicas are fully independent
-        raise ValueError(f"{label}: dp_size > 1 is only meaningful for MoE models, where it shards "
-                         "requests and their KV cache across attention replicas and, together with "
-                         "tp, distributes the experts. For dense models run independent replicas.")
+        raise ValueError(f"{label}: dp_size > 1 is only meaningful for MoE models")
     _validate_model_parallelism(model, tp, pp, label)
     cfg = ParallelismConfig(tp_size=tp, pp_size=pp, dp_size=dp, ep_size=ep)
     if model.moe is not None:
@@ -336,13 +325,7 @@ def _build_parallelism_block(block: dict, model: ModelConfig, label: str,
             raise ValueError(f"{label}: num_experts ({model.moe.num_experts}) must be divisible by "
                              f"ep ({cfg.ep}); experts are kept whole (etp=1).")
         if cfg.ep > model.moe.num_experts:
-            raise ValueError(f"{label}: ep ({cfg.ep}) exceeds num_experts ({model.moe.num_experts}); "
-                             "an expert is never split (etp=1). Lower ep_size, or raise pp_size so "
-                             "that tp*dp per stage drops to the expert count.")
-        if inference and cfg.edp > 1:
-            raise ValueError(f"{label}: ep_size ({cfg.ep}) below tp_size*dp_size ({stage}) implies "
-                             f"edp={cfg.edp}, i.e. replicated experts. In inference that is EPLB-style "
-                             "redundancy, which is not modelled. Leave ep_size unset to derive tp*dp.")
+            raise ValueError(f"{label}: ep ({cfg.ep}) exceeds num_experts ({model.moe.num_experts})")
     return cfg
 
 def _build_inference_parallelism(data: dict, model: ModelConfig) -> tuple[ParallelismConfig, ParallelismConfig]:

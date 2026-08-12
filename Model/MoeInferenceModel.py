@@ -18,8 +18,7 @@ class MoeInferenceModel(BaseInferenceModel):
         self._parallelism = parallelism
         self.plan = plan if plan is not None else RoutingPlan(model_cfg.moe, routing)
         self.layers = [
-            MoeInferenceLayer(model_cfg=model_cfg, moe=model_cfg.moe, plan=self.plan,
-                              layer_idx=idx, tp_size=parallelism.tp_size)
+            MoeInferenceLayer(model_cfg=model_cfg, moe=model_cfg.moe, plan=self.plan, layer_idx=idx, tp_size=parallelism.tp_size, dp_size=parallelism.dp_size)
             for idx in range(model_cfg.num_layers)
         ]
 

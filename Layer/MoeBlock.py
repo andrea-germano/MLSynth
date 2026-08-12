@@ -6,7 +6,7 @@ from Layer.DenseBlockMath import DenseBlockMath
 from Layer.Layer import MoeEpContext
 from Utils.config import ModelConfig
 from Utils.naming import a2a_name
-from Utils.nodes import alltoall, alltoall_v
+from Utils.nodes import alltoall_v
 from Utils.routing import RoutingPlan
 
 
@@ -16,9 +16,9 @@ class MoeBlockCosts(NamedTuple):
     gate_bytes: int
     expert_flops: int
     expert_bytes: int
-    combine_flops: int     # weighted sum of each token's top_k expert outputs
+    combine_flops: int # weighted sum of each token's top_k expert outputs
     combine_bytes: int
-    traffic: object        # [ep, ep] routed token copies; rows are sources, columns destinations
+    traffic: object # [ep, ep] routed token copies; rows are sources, columns destinations
 
 
 class MoeBlock:
@@ -39,7 +39,7 @@ class MoeBlock:
 
     def costs(self, *, key: tuple, ep_ctx: MoeEpContext, local_tokens: int) -> MoeBlockCosts:
         """`local_tokens` is what this device owns and routes."""
-        top_k, num_experts = self.moe.top_k, self.moe.num_experts
+        num_experts = self.moe.num_experts
         hidden, b, scale = self.hidden_size, self.bytes_per_val, self.scale
 
         origin_tokens = ep_ctx.origin_tokens or [local_tokens] * ep_ctx.size
@@ -53,27 +53,49 @@ class MoeBlock:
         gate_bytes = int(scale * local_tokens * hidden * b)
 
         traffic = self.plan.traffic_matrix(key, self.layer_idx, origin_tokens)
-        tokens_routed_here = int(traffic[:, ep_ctx.ep_rank].sum())   # column sum, diagonal included
-        expert_flops, expert_bytes = self.expert_math.ffn_costs(tokens_routed_here, weight_copies=num_experts // ep_ctx.size)
+        expert_flops, expert_bytes = self._expert_costs(key, ep_ctx, origin_tokens, traffic)
 
-        # after the combine, a token sums its top_k expert outputs weighted by its gate scores: one multiply-add per element per expert
-        combine_flops = int(scale * 2 * top_k * local_tokens * hidden)
-        combine_bytes = int(scale * (top_k + 1) * local_tokens * hidden * b)
+        # the weighted sum reads what actually comes back: this rank's wire row, diagonal
+        # included. One multiply-add per returned vector per element, plus the write of the local tokens' outputs.
+        returned = int(traffic[ep_ctx.ep_rank].sum())
+        combine_flops = int(scale * 2 * returned * hidden)
+        combine_bytes = int(scale * (returned + local_tokens) * hidden * b)
 
         return MoeBlockCosts(gate_flops, gate_bytes, expert_flops, expert_bytes, combine_flops, combine_bytes, traffic)
 
-    def exchange(self, nodes: list, matrix, ep_ctx: MoeEpContext, *, op: str, parents, it, name_prefix: str) -> list[ChakraNode]:
-        """Emit one all-to-all over `matrix`, appending to `nodes`"""
+    def _expert_costs(self, key, ep_ctx, origin_tokens, traffic) -> tuple[int, int]:
+        """FFN cost of everything routed to this rank. The weights read are those of the
+        experts actually HIT (grouped GEMM semantics), not the whole local block"""
+        tokens_routed_here = int(traffic[:, ep_ctx.ep_rank].sum())   # column sum, diagonal included
+        if not tokens_routed_here:
+            return 0, 0
+        hit = self.plan.experts_hit(key, self.layer_idx, origin_tokens, ep_ctx.ep_rank)
+        return self.expert_math.ffn_costs(tokens_routed_here, weight_copies=hit)
+
+    def masked_costs(self, *, key: tuple, ep_ctx: MoeEpContext, tokens: int) -> MoeBlockCosts:
+        """The no-a2a regime (dp = 1 with tp > 1): vLLM activates no all-to-all kernel there, so after the attention all-reduce every tensor rank holds ALL tokens replicated."""
+        top_k, num_experts = self.moe.top_k, self.moe.num_experts
+        hidden, b, scale = self.hidden_size, self.bytes_per_val, self.scale
+        origin_tokens = ep_ctx.origin_tokens or [tokens // ep_ctx.size] * ep_ctx.size
+
+        # router replicated over the FULL token set, not this rank's 1/tp slice
+        gate_flops = int(scale * 2 * tokens * hidden * num_experts)
+        gate_bytes = int(scale * tokens * hidden * b)
+
+        traffic = self.plan.traffic_matrix(key, self.layer_idx, origin_tokens)
+        expert_flops, expert_bytes = self._expert_costs(key, ep_ctx, origin_tokens, traffic)
+
+        # weighted accumulation of the local experts' outputs into this rank's partial: one multiply-add per routed copy per element; reads each copy and writes the whole partial, which is full-size
+        copies_here = int(traffic[:, ep_ctx.ep_rank].sum())
+        combine_flops = int(scale * 2 * copies_here * hidden)
+        combine_bytes = int(scale * (copies_here + tokens) * hidden * b)
+
+        return MoeBlockCosts(gate_flops, gate_bytes, expert_flops, expert_bytes,combine_flops, combine_bytes, traffic)
+
+    def exchange(self, nodes: list, matrix, ep_ctx: MoeEpContext, *, op: str, parents, it) -> list[ChakraNode]:
+        """Emit one routed all-to-all over `matrix` as explicit p2p SEND/RECV pairs"""
         if ep_ctx.size <= 1: # every expert is local: nothing to exchange
             return []
-
-        if self.plan.routing.dispatch == "collective":
-            # Training-only baseline (inference forbids it in config). comm_size is this device's
-            # TOTAL routed volume, own share included, read off the matrix itself
-            own_row = int(matrix[ep_ctx.ep_rank].sum())
-            node = alltoall(self.edge_bytes(own_row), pg_name=ep_ctx.pg_name, parents=parents, name=f"{name_prefix}_ep_alltoall_{op}")
-            nodes.append(node)
-            return [node]
 
         def edge_name(src_ep, dst_ep):
             return a2a_name(pl=ep_ctx.pool, op=op, stage=ep_ctx.stage, se=src_ep, de=dst_ep, L=self.layer_idx, it=it,cl=ep_ctx.cluster if ep_ctx.clusters > 1 else None)

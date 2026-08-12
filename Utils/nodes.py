@@ -24,6 +24,8 @@ from chakra.schema.protobuf.et_def_pb2 import (
     COMM_COLL_NODE,
     ALL_REDUCE,
     ALL_TO_ALL,
+    ALL_GATHER,
+    REDUCE_SCATTER,
     COMP_NODE
 )
 
@@ -97,6 +99,30 @@ def alltoall(coll_size: int, pg_name: Optional[str] = None, name: str = "COMM_CO
     node = get_node(name, COMM_COLL_NODE)
     node.attr.append(ChakraAttr(name="is_cpu_op", bool_val=False))
     node.attr.append(ChakraAttr(name="comm_type", int64_val=ALL_TO_ALL))
+    node.attr.append(ChakraAttr(name="comm_size", int64_val=coll_size))
+    if pg_name:
+        node.attr.append(ChakraAttr(name="pg_name", string_val=pg_name))
+    add_dependencies(node, parents)
+    return node
+
+def reduce_scatter(coll_size: int, pg_name: Optional[str] = None, name: str = "COMM_COLL_NODE_Reduce-Scatter", parents: Optional[List[ChakraNode]] = None) -> ChakraNode:
+    """Half of a ring all-reduce: reduce, then keep only this rank's slice.
+    `coll_size` is the WHOLE tensor, the same convention as `allreduce`"""
+    node = get_node(name, COMM_COLL_NODE)
+    node.attr.append(ChakraAttr(name="is_cpu_op", bool_val=False))
+    node.attr.append(ChakraAttr(name="comm_type", int64_val=REDUCE_SCATTER))
+    node.attr.append(ChakraAttr(name="comm_size", int64_val=coll_size))
+    if pg_name:
+        node.attr.append(ChakraAttr(name="pg_name", string_val=pg_name))
+    add_dependencies(node, parents)
+    return node
+
+def all_gather(coll_size: int, pg_name: Optional[str] = None, name: str = "COMM_COLL_NODE_All-Gather", parents: Optional[List[ChakraNode]] = None) -> ChakraNode:
+    """The other half: every rank's slice, gathered back into the whole tensor.
+    `coll_size` is THIS RANK'S SHARD, not the whole tensor"""
+    node = get_node(name, COMM_COLL_NODE)
+    node.attr.append(ChakraAttr(name="is_cpu_op", bool_val=False))
+    node.attr.append(ChakraAttr(name="comm_type", int64_val=ALL_GATHER))
     node.attr.append(ChakraAttr(name="comm_size", int64_val=coll_size))
     if pg_name:
         node.attr.append(ChakraAttr(name="pg_name", string_val=pg_name))

@@ -24,7 +24,6 @@ class MoeEpContext:
     stage: int = 0      # this device's pipeline stage (naming only)
     pool: str = "t"     # "p"/"d" for the inference pools, "t" for training (naming only)
     origin_tokens: List[int] | None = None  # tokens each peer routes; None = every peer routes the caller's local count
-    pg_name: str | None = None   # EP process group, used only by the collective dispatch path
 
     @property
     def size(self) -> int:

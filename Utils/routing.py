@@ -34,7 +34,11 @@ class RoutingPlan:
     def traffic_matrix(self, key: tuple, layer: int, origin_tokens: list[int]) -> np.ndarray:
         """[ep, ep] int matrix of routed token copies; M[s][d] = copies sent by EP rank s to
         experts hosted on EP rank d (diagonal included: local copies count for compute, are
-        never emitted as traffic). ep is derived from len(origin_tokens).."""
+        never emitted as traffic). ep is derived from len(origin_tokens)."""
+        return self._matrices(key, layer, origin_tokens)[0]
+
+    def _matrices(self, key: tuple, layer: int, origin_tokens: list[int]):
+        """(M, routed) for one realisation, cached together. `routed` is the per-expert copy count over the whole group, kept for experts_hit"""
         ep = len(origin_tokens)
         cache_key = (key, ep, tuple(origin_tokens))
         if cache_key in self._cache:
@@ -61,14 +65,20 @@ class RoutingPlan:
                 g += 1
 
         self._check_marginals(M, origin_tokens, routed, ep)
-        self._cache[cache_key] = M
-        return M
+        self._cache[cache_key] = (M, routed)
+        return M, routed
 
     def tokens_on_rank(self, key: tuple, layer: int, origin_tokens: list[int], dst: int) -> int:
         """Routed copies computed by EP rank dst = column sum, DIAGONAL INCLUDED
         (local tokens cost FLOPs even though they generate no traffic)."""
         M = self.traffic_matrix(key, layer, origin_tokens)
         return int(M[:, dst].sum())
+
+    def experts_hit(self, key: tuple, layer: int, origin_tokens: list[int], dst: int) -> int:
+        """How many of dst's local experts received at least one token copy. The grouped GEMM reads only those weight sets; the untouched experts stay in HBM unread."""
+        routed = self._matrices(key, layer, origin_tokens)[1]
+        block = self.moe.num_experts // len(origin_tokens)
+        return int(np.count_nonzero(routed[dst * block:(dst + 1) * block]))
 
     def _check_marginals(self, M, origin_tokens, routed, ep) -> None:
         k = self.moe.top_k

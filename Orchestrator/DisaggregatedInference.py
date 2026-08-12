@@ -126,9 +126,12 @@ class DisaggregatedInference(Orchestrator):
                 "key": key, "step": step}
 
     def _origin_tokens(self, pool: str, tokens_per_slice: List[int]) -> List[int]:
-        """Tokens owned by each device of a stage. Sequence parallelism splits a slice's tokens
-        across its tp ranks; the remainder goes to the lowest tp ranks so that no token is
-        dropped when the slice is smaller than tp (the decode regime)."""
+        """Tokens owned by each device of a stage: a slice's tokens are split across its tp
+        ranks so each token enters the all-to-all exactly once (vLLM's sequence-parallel MoE
+        dispatch, `use_sequence_parallel_moe`, active when EP is on with tp>1 AND dp>1). The
+        remainder goes to the lowest tp ranks so that no token is dropped when the slice is
+        smaller than tp (the decode regime). With dp=1 and tp>1 the split still feeds the
+        routing matrix, but the layer emits the masked no-a2a path (see MoeInferenceLayer)."""
         cfg = self.prefill_cfg if pool == "p" else self.decode_cfg
         return [tokens_per_slice[dp] // cfg.tp_size + (tp < tokens_per_slice[dp] % cfg.tp_size)
                 for dp in range(cfg.dp_size) for tp in range(cfg.tp_size)]
@@ -408,18 +411,16 @@ class DisaggregatedInference(Orchestrator):
         for step in range(self.max_decode_steps):
             for stage in range(cfg.pp_size):
               for dp_rank in range(dp_size):
-                # a slice keeps only its own still-generating requests; a slice that runs dry
-                # still walks the whole schedule, which is what vLLM does with dummy forward
-                # passes so that the DP ranks stay in lockstep for the expert layers
+                # a slice keeps only its own still-generating requests; a slice that runs dry still walks the whole schedule (vLLM dummy forward)
                 active_requests = [i for i in self._slice(dp_rank, dp_size)
                                    if self.requests[i].gen_len > step]
                 # KV length = prompt + steps already done + the token produced now
-                current_kv_lens = [self.requests[i].prompt_len + step + 1 for i in active_requests]
-                pp_decode_bytes = self._activation_bytes(len(active_requests))
+                current_kv_lens = ([self.requests[i].prompt_len + step + 1 for i in active_requests] or [1])  # the dummy token attends to itself only
+                pp_decode_bytes = self._activation_bytes(max(1, len(active_requests)))
                 origin_tokens = None
                 if self.moe:
-                    active_per_slice = [len([i for i in self._slice(dp, dp_size)
-                                             if self.requests[i].gen_len > step])
+                    active_per_slice = [max(1, len([i for i in self._slice(dp, dp_size)
+                                                    if self.requests[i].gen_len > step]))
                                         for dp in range(dp_size)]
                     origin_tokens = self._origin_tokens("d", active_per_slice)
 
@@ -459,8 +460,7 @@ class DisaggregatedInference(Orchestrator):
                             dependencies += self._get_kv_arrival_dependencies(global_layer_idx, npu, local_layer_idx)
                             if local_layer_idx == 0:
                                 # The first layer of the first decode stage must also wait for the first token from prefill
-                                # every prefill device that produced one of this slice's
-                                # first tokens must have handed it over
+                                # every prefill device that produced one of this slice's first tokens must have handed it over
                                 dependencies += self._first_token_recv.get(npu, [])
                         if dependencies:
                             add_dependencies(emit_result.nodes[0], dependencies)

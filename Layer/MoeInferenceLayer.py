@@ -7,16 +7,20 @@ from Layer.DenseBlockMath import DenseBlockMath
 from Layer.MoeBlock import MoeBlock
 from Utils.config import MoeConfig
 from Utils.naming import comp_name, coll_name
-from Utils.nodes import allreduce, compute
+from Utils.nodes import all_gather, allreduce, compute, reduce_scatter
 from Utils.routing import RoutingPlan
 
 
 class MoeInferenceLayer(BaseInferenceLayer):
     """A single Mixture-of-Experts inference block:
-        attention -> [all-reduce] -> gating -> dispatch -> experts -> combine -> weighted sum
-    The attention half is identical to the dense block: MoE changes the FFN, not the cache """
+        attention -> [reduce-scatter] -> gating -> dispatch -> experts -> combine -> weighted sum -> [all-gather]
+    The attention half computes exactly what the dense block computes. What it also changes is the TENSOR-PARALLEL collective around it: here the
+    expert half is sequence-parallel (each tensor rank owns 1/tp of the tokens and dispatches them) so the first all-reduce is split into the 
+    reduce-scatter that feeds it and the all-gather that closes it
+    With dp = 1 and tp > 1 vLLM activates no a2a kernel at all: tokens stay replicated on the tensor ranks and the block degenerates to the
+    dense-like shape, two all-reduces around masked local-expert ffn compute (_emit_masked)."""
 
-    def __init__(self, model_cfg, moe: MoeConfig, plan: RoutingPlan, layer_idx: int, tp_size: int = 1):
+    def __init__(self, model_cfg, moe: MoeConfig, plan: RoutingPlan, layer_idx: int, tp_size: int = 1, dp_size: int = 1):
         # attention follows the tensor sharding; the MoE half has its own cost model, shared
         # with the training layer, which keeps the experts whole
         self.math_attn = DenseBlockMath.from_model_cfg(model_cfg, tp_size)
@@ -26,6 +30,7 @@ class MoeInferenceLayer(BaseInferenceLayer):
         self.plan = plan
         self.layer_idx = layer_idx
         self.tp_size = tp_size
+        self.dp_size = dp_size
 
     @property
     def attn_weight_elems(self) -> int:
@@ -51,9 +56,12 @@ class MoeInferenceLayer(BaseInferenceLayer):
         return self._emit(name, pg_name, attn_flops, attn_bytes, batch_size, ep_ctx, key, step)
 
     def _emit(self, name, pg_name, attn_flops, attn_bytes, tokens, ep_ctx, key, step) -> LayerEmission:
+        if self.tp_size > 1 and self.dp_size == 1:
+            return self._emit_masked(name, pg_name, attn_flops, attn_bytes, tokens, ep_ctx, key)
         # sequence parallelism: this device owns 1/tp of its slice's tokens, full hidden each
         local_tokens = tokens // self.tp_size
         c = self.moe_block.costs(key=key, ep_ctx=ep_ctx, local_tokens=local_tokens)
+        wire = c.traffic
         nodes: List[ChakraNode] = []
 
         # 1. attention, identical to the dense block
@@ -61,7 +69,7 @@ class MoeInferenceLayer(BaseInferenceLayer):
         nodes.append(attn)
         attn_end = attn
         if self.tp_size > 1:
-            attn_end = allreduce(self.math_attn.allreduce_bytes(tokens), pg_name=pg_name, parents=[attn], name=coll_name(name, "attn"))
+            attn_end = reduce_scatter(self.math_attn.allreduce_bytes(tokens), pg_name=pg_name,parents=[attn], name=coll_name(name, "rs"))
             nodes.append(attn_end)
         kv_ready = attn_end          # the cache exists once attention has run: unchanged by MoE
 
@@ -70,17 +78,47 @@ class MoeInferenceLayer(BaseInferenceLayer):
         nodes.append(gate)
 
         # 3. dispatch: tokens travel to the devices hosting their experts
-        arrived = self.moe_block.exchange(nodes, c.traffic, ep_ctx, op="disp", parents=[gate], it=step, name_prefix=name)
+        arrived = self.moe_block.exchange(nodes, wire, ep_ctx, op="disp", parents=[gate], it=step)
 
         # 4. expert FFN over everything routed here, local copies included
         ffw = compute(c.expert_flops, c.expert_bytes, parents=arrived + [gate], name=comp_name(name, "ffw"))
         nodes.append(ffw)
 
         # 5. combine: the transposed matrix returns the results to the token owners
-        returned = self.moe_block.exchange(nodes, c.traffic.T, ep_ctx, op="comb", parents=[ffw], it=step, name_prefix=name)
+        returned = self.moe_block.exchange(nodes, wire.T, ep_ctx, op="comb", parents=[ffw], it=step)
 
-        # 6. weighted sum of each token's top_k expert outputs. Depending on every incoming
-        #    combine edge, it is also the single tail the orchestrator chains the next layer on.
+        # 6. weighted sum of each token's top_k expert outputs.
         tail = compute(c.combine_flops, c.combine_bytes, parents=returned + [ffw], name=comp_name(name, "comb"))
+        nodes.append(tail)
+
+        # 7. all-gather closing the sequence-parallel window opened by the reduce-scatter
+        if self.tp_size > 1:
+            # the shard, not the whole tensor: all_gather's coll_size is per rank
+            tail = all_gather(self.math_attn.allreduce_bytes(tokens) // self.tp_size, pg_name=pg_name, parents=[tail], name=coll_name(name, "ag"))
+            nodes.append(tail)
+        return LayerEmission(nodes=nodes, tail=tail, kv_ready=kv_ready)
+
+    def _emit_masked(self, name, pg_name, attn_flops, attn_bytes, tokens, ep_ctx, key) -> LayerEmission:
+        """dp = 1 with tp > 1: no token ever moves. Dense-like frame with the FFN
+        replaced by router + masked local experts + weighted accumulation of the partials."""
+        c = self.moe_block.masked_costs(key=key, ep_ctx=ep_ctx, tokens=tokens)
+        ar_bytes = self.math_attn.allreduce_bytes(tokens)
+        nodes: List[ChakraNode] = []
+
+        attn = compute(attn_flops, attn_bytes, name=comp_name(name, "attn"))
+        nodes.append(attn)
+        attn_end = allreduce(ar_bytes, pg_name=pg_name, parents=[attn], name=coll_name(name, "attn"))
+        nodes.append(attn_end)
+        kv_ready = attn_end
+
+        gate = compute(c.gate_flops, c.gate_bytes, parents=[attn_end], name=comp_name(name, "gate"))
+        nodes.append(gate)
+        ffw = compute(c.expert_flops, c.expert_bytes, parents=[gate], name=comp_name(name, "ffw"))
+        nodes.append(ffw)
+        comb = compute(c.combine_flops, c.combine_bytes, parents=[ffw], name=comp_name(name, "comb"))
+        nodes.append(comb)
+
+        # every rank holds a PARTIAL of the full output (its experts' contributions only)
+        tail = allreduce(ar_bytes, pg_name=pg_name, parents=[comb], name=coll_name(name, "ffw"))
         nodes.append(tail)
         return LayerEmission(nodes=nodes, tail=tail, kv_ready=kv_ready)
