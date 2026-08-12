@@ -99,8 +99,8 @@ class ComputeWrapper(BaseWrapper):
             op = ops[i]
             if op.type == ChakraNodeType.COMP_NODE:
                 if attr_val(op, "num_ops") == 0 and attr_val(op, "tensor_size") == 0:
-                    continue  # zero-cost barrier nodes (MoE tails): a slowdown of 0 is pure noise
-                slow_node = compute(int(attr_val(op, "num_ops") * slowdown),
+                    continue  # nothing to slow down
+                slow_node = compute(max(1, int(attr_val(op, "num_ops") * slowdown)),
                                     max(1, int(attr_val(op, "tensor_size") * slowdown)),
                                     parents=[op], name=f"{op.name}_slowdown")
                 # Rewire EVERY dependent of op onto the slowdown node.
@@ -116,8 +116,10 @@ class ComputeWrapper(BaseWrapper):
         """Apply the slowdown to a LayerEmission, retargeting tail/kv_ready when the node they
         point to gained a trailing slowdown node (otherwise KV/PP sends would not wait for it)."""
         nodes, replaced = self._insert_slowdown(list(emission.nodes), slowdown)
+        tail = emission.tail
+        # A LIST tail is the combine recvs of a tp=1 MoE block (see LayerEmission)
         return LayerEmission(
             nodes=nodes,
-            tail=replaced.get(emission.tail.id, emission.tail),
+            tail=tail if isinstance(tail, list) else replaced.get(tail.id, tail),
             kv_ready=replaced.get(emission.kv_ready.id, emission.kv_ready),
         )

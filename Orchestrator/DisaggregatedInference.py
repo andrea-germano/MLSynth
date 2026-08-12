@@ -101,6 +101,15 @@ class DisaggregatedInference(Orchestrator):
         return [i for i in range(len(self.requests)) if i % dp_size == dp_rank]
 
     @staticmethod
+    def _deps(last_node_per_npu: Dict, npu: int) -> List:
+        """What the next node on `npu` must depend on, as a list. Entries are single nodes, except
+        for a MoE layer with tp=1 and ep>1 whose tail is the set of combine recvs (LayerEmission)"""
+        v = last_node_per_npu[npu]
+        if v is None:
+            return []
+        return list(v) if isinstance(v, list) else [v]
+
+    @staticmethod
     def _dp_field(dp_rank: int, cfg) -> int | None:
         """dp coordinate for a node name, omitted when there is a single slice so that dense traces keep their original names."""
         return dp_rank if cfg.dp_size > 1 else None
@@ -259,7 +268,7 @@ class DisaggregatedInference(Orchestrator):
                                  dp=self._dp_field(dp_rank, cfg))
                     recv_node = receive(
                         sender=prev_stage_npu, receiver=npu, size=pp_bytes,
-                        parents=[last_node_per_npu[npu]] if last_node_per_npu[npu] else None,
+                        parents=self._deps(last_node_per_npu, npu) or None,
                         name=name, tag = comm_tag(name)
                     )
                     nodes[npu].append(recv_node)
@@ -277,7 +286,7 @@ class DisaggregatedInference(Orchestrator):
                                                                  (PHASE_PREFILL, global_layer_idx))
                     )
                     if last_node_per_npu[npu]:
-                        add_dependencies(emit_result.nodes[0], [last_node_per_npu[npu]])
+                        add_dependencies(emit_result.nodes[0], self._deps(last_node_per_npu, npu))
                     nodes[npu].extend(emit_result.nodes)
                     last_node_per_npu[npu] = emit_result.tail
                     kv_ready_hooks[(global_layer_idx, npu)] = emit_result.kv_ready
@@ -289,7 +298,7 @@ class DisaggregatedInference(Orchestrator):
                                  dp=self._dp_field(dp_rank, cfg))
                     send_node = send(
                         sender=npu, receiver=next_stage_npu, size=pp_bytes,
-                        parents=[last_node_per_npu[npu]] if last_node_per_npu[npu] else None,
+                        parents=self._deps(last_node_per_npu, npu) or None,
                         name=name, tag = comm_tag(name)
                     )
                     nodes[npu].append(send_node)
@@ -330,7 +339,7 @@ class DisaggregatedInference(Orchestrator):
             name_kv = kv_name(src_stage=ps, dst_stage=ds, ssh=sr, dsh=dr, seg="all", it=0,
                               sdp=self._dp_field(sdp, self.prefill_cfg),
                               ddp=self._dp_field(ddp, self.decode_cfg))
-            ready_hook = last_node_per_npu[src_npu]
+            ready_hook = self._deps(last_node_per_npu, src_npu)
             recv_node = self._create_kv_transfer_pair(nodes, src_npu, dst_npu, size, ready_hook, name_kv)
             self._bulk_recv[dst_npu].append(recv_node)
 
@@ -338,10 +347,14 @@ class DisaggregatedInference(Orchestrator):
         """Emit the SEND/RECV pair for a single KV transfer. The SEND is gated on
         `ready_hook` so the cache is only pushed once prefill has produced it; the
         RECV is dependency-free on the decode side and is consumed by the first
-        decode step that needs this layer's KV."""
+        decode step that needs this layer's KV.
+
+        `ready_hook` is one node (streaming: this layer's kv_ready) or a list (bulk: the whole
+        NPU's prefill tail, which a tp=1 MoE block leaves as several combine recvs)."""
+        parents = ready_hook if isinstance(ready_hook, list) else [ready_hook]
         kv_send = send(
             sender=src_npu, receiver=dst_npu, size=size,
-            parents=[ready_hook], name=name_kv, tag=comm_tag(name_kv)
+            parents=parents, name=name_kv, tag=comm_tag(name_kv)
         )
         nodes[src_npu].append(kv_send)
         kv_recv = receive(
@@ -386,7 +399,7 @@ class DisaggregatedInference(Orchestrator):
                                          sdp=self._dp_field(src_dp, cfg_p),
                                          ddp=self._dp_field(dst_dp, cfg_d))
                     send_node = send(sender=src_npu, receiver=dst_npu, size=SAMPLE_BYTES,
-                                     parents=[last_node_per_npu[src_npu]],
+                                     parents=self._deps(last_node_per_npu, src_npu),
                                      name=name, tag=comm_tag(name))
                     nodes[src_npu].append(send_node)
                     recv_node = receive(sender=src_npu, receiver=dst_npu, size=SAMPLE_BYTES,
@@ -434,7 +447,7 @@ class DisaggregatedInference(Orchestrator):
                                        dp=self._dp_field(dp_rank, cfg))
                         recv_node = receive(
                             sender=npu - stage_stride, receiver=npu, size=pp_decode_bytes, 
-                            parents=[last_node_per_npu[npu]] if last_node_per_npu[npu] else None,
+                            parents=self._deps(last_node_per_npu, npu) or None,
                             name=name, tag=comm_tag(name)
                         )
                         nodes[npu].append(recv_node)
@@ -454,7 +467,7 @@ class DisaggregatedInference(Orchestrator):
 
                         dependencies=[]
                         if last_node_per_npu[npu]:
-                            dependencies.append(last_node_per_npu[npu])
+                            dependencies += self._deps(last_node_per_npu, npu)
                         if step == 0:
                             # Make sure the first decode step waits for the KV cache to be ready
                             dependencies += self._get_kv_arrival_dependencies(global_layer_idx, npu, local_layer_idx)
@@ -474,7 +487,7 @@ class DisaggregatedInference(Orchestrator):
                                        dp=self._dp_field(dp_rank, cfg))
                         send_node = send(
                             sender=npu, receiver=next_stage_npu, size=pp_decode_bytes, 
-                            parents=[last_node_per_npu[npu]] if last_node_per_npu[npu] else None,
+                            parents=self._deps(last_node_per_npu, npu) or None,
                             name=name, tag=comm_tag(name)
                         )
                         nodes[npu].append(send_node)
@@ -500,7 +513,7 @@ class DisaggregatedInference(Orchestrator):
 
             send_node = send(
                 sender=src_npu, receiver=dst_npu, size=SAMPLE_BYTES, 
-                parents=[last_node_per_npu[src_npu]] if last_node_per_npu[src_npu] else None,
+                parents=self._deps(last_node_per_npu, src_npu) or None,
                 name=name, tag=comm_tag(name)
             )
             nodes[src_npu].append(send_node)
@@ -508,7 +521,7 @@ class DisaggregatedInference(Orchestrator):
 
             recv_node = receive(
                 sender=src_npu, receiver=dst_npu, size=SAMPLE_BYTES, 
-                parents=[last_node_per_npu[dst_npu]] if last_node_per_npu[dst_npu] else None,
+                parents=self._deps(last_node_per_npu, dst_npu) or None,
                 name=name, tag=comm_tag(name)
             )
             nodes[dst_npu].append(recv_node)

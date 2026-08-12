@@ -16,8 +16,6 @@ class MoeBlockCosts(NamedTuple):
     gate_bytes: int
     expert_flops: int
     expert_bytes: int
-    combine_flops: int # weighted sum of each token's top_k expert outputs
-    combine_bytes: int
     traffic: object # [ep, ep] routed token copies; rows are sources, columns destinations
 
 
@@ -55,13 +53,8 @@ class MoeBlock:
         traffic = self.plan.traffic_matrix(key, self.layer_idx, origin_tokens)
         expert_flops, expert_bytes = self._expert_costs(key, ep_ctx, origin_tokens, traffic)
 
-        # the weighted sum reads what actually comes back: this rank's wire row, diagonal
-        # included. One multiply-add per returned vector per element, plus the write of the local tokens' outputs.
-        returned = int(traffic[ep_ctx.ep_rank].sum())
-        combine_flops = int(scale * 2 * returned * hidden)
-        combine_bytes = int(scale * (returned + local_tokens) * hidden * b)
-
-        return MoeBlockCosts(gate_flops, gate_bytes, expert_flops, expert_bytes, combine_flops, combine_bytes, traffic)
+        # NO combine cost. The weighted sum of each token's expert outputs is arithmetic performed INSIDE a communication primitive
+        return MoeBlockCosts(gate_flops, gate_bytes, expert_flops, expert_bytes, traffic)
 
     def _expert_costs(self, key, ep_ctx, origin_tokens, traffic) -> tuple[int, int]:
         """FFN cost of everything routed to this rank. The weights read are those of the
@@ -74,7 +67,7 @@ class MoeBlock:
 
     def masked_costs(self, *, key: tuple, ep_ctx: MoeEpContext, tokens: int) -> MoeBlockCosts:
         """The no-a2a regime (dp = 1 with tp > 1): vLLM activates no all-to-all kernel there, so after the attention all-reduce every tensor rank holds ALL tokens replicated."""
-        top_k, num_experts = self.moe.top_k, self.moe.num_experts
+        num_experts = self.moe.num_experts
         hidden, b, scale = self.hidden_size, self.bytes_per_val, self.scale
         origin_tokens = ep_ctx.origin_tokens or [tokens // ep_ctx.size] * ep_ctx.size
 
@@ -85,12 +78,14 @@ class MoeBlock:
         traffic = self.plan.traffic_matrix(key, self.layer_idx, origin_tokens)
         expert_flops, expert_bytes = self._expert_costs(key, ep_ctx, origin_tokens, traffic)
 
-        # weighted accumulation of the local experts' outputs into this rank's partial: one multiply-add per routed copy per element; reads each copy and writes the whole partial, which is full-size
+        # Weighted accumulation of the local experts' outputs into this rank's partial: one
+        # multiply-add per routed copy per element, reading each copy and writing the whole partial
         copies_here = int(traffic[:, ep_ctx.ep_rank].sum())
-        combine_flops = int(scale * 2 * copies_here * hidden)
-        combine_bytes = int(scale * (copies_here + tokens) * hidden * b)
+        if copies_here:
+            expert_flops += int(scale * 2 * copies_here * hidden)
+            expert_bytes += int(scale * (copies_here + tokens) * hidden * b)
 
-        return MoeBlockCosts(gate_flops, gate_bytes, expert_flops, expert_bytes,combine_flops, combine_bytes, traffic)
+        return MoeBlockCosts(gate_flops, gate_bytes, expert_flops, expert_bytes, traffic)
 
     def exchange(self, nodes: list, matrix, ep_ctx: MoeEpContext, *, op: str, parents, it) -> list[ChakraNode]:
         """Emit one routed all-to-all over `matrix` as explicit p2p SEND/RECV pairs"""

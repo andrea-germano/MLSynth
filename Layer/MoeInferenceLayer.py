@@ -13,7 +13,7 @@ from Utils.routing import RoutingPlan
 
 class MoeInferenceLayer(BaseInferenceLayer):
     """A single Mixture-of-Experts inference block:
-        attention -> [reduce-scatter] -> gating -> dispatch -> experts -> combine -> weighted sum -> [all-gather]
+        attention -> [reduce-scatter] -> gating -> dispatch -> experts -> combine -> [all-gather]
     The attention half computes exactly what the dense block computes. What it also changes is the TENSOR-PARALLEL collective around it: here the
     expert half is sequence-parallel (each tensor rank owns 1/tp of the tokens and dispatches them) so the first all-reduce is split into the 
     reduce-scatter that feeds it and the all-gather that closes it
@@ -73,29 +73,35 @@ class MoeInferenceLayer(BaseInferenceLayer):
             nodes.append(attn_end)
         kv_ready = attn_end          # the cache exists once attention has run: unchanged by MoE
 
+        # A COMP node is emitted only when it has work to do
         # 2. router: assigns each locally owned token to its top_k experts
-        gate = compute(c.gate_flops, c.gate_bytes, parents=[attn_end], name=comp_name(name, "gate"))
-        nodes.append(gate)
+        routed = [attn_end]
+        if c.gate_bytes:
+            gate = compute(c.gate_flops, c.gate_bytes, parents=[attn_end], name=comp_name(name, "gate"))
+            nodes.append(gate)
+            routed = [gate]
 
         # 3. dispatch: tokens travel to the devices hosting their experts
-        arrived = self.moe_block.exchange(nodes, wire, ep_ctx, op="disp", parents=[gate], it=step)
+        arrived = self.moe_block.exchange(nodes, wire, ep_ctx, op="disp", parents=routed, it=step)
 
-        # 4. expert FFN over everything routed here, local copies included
-        ffw = compute(c.expert_flops, c.expert_bytes, parents=arrived + [gate], name=comp_name(name, "ffw"))
-        nodes.append(ffw)
+        # 4. expert FFN over everything routed here, local copies included. Skipped when the router sent this rank nothing
+        after_experts = arrived + routed
+        if c.expert_bytes:
+            ffw = compute(c.expert_flops, c.expert_bytes, parents=arrived + routed, name=comp_name(name, "ffw"))
+            nodes.append(ffw)
+            after_experts = [ffw]
 
         # 5. combine: the transposed matrix returns the results to the token owners
-        returned = self.moe_block.exchange(nodes, wire.T, ep_ctx, op="comb", parents=[ffw], it=step)
+        returned = self.moe_block.exchange(nodes, wire.T, ep_ctx, op="comb", parents=after_experts, it=step)
 
-        # 6. weighted sum of each token's top_k expert outputs.
-        tail = compute(c.combine_flops, c.combine_bytes, parents=returned + [ffw], name=comp_name(name, "comb"))
-        nodes.append(tail)
-
-        # 7. all-gather closing the sequence-parallel window opened by the reduce-scatter
+        # 6. all-gather closing the sequence-parallel window opened by the reduce-scatter
         if self.tp_size > 1:
             # the shard, not the whole tensor: all_gather's coll_size is per rank
-            tail = all_gather(self.math_attn.allreduce_bytes(tokens) // self.tp_size, pg_name=pg_name, parents=[tail], name=coll_name(name, "ag"))
+            tail = all_gather(self.math_attn.allreduce_bytes(tokens) // self.tp_size, pg_name=pg_name, parents=returned + after_experts, name=coll_name(name, "ag"))
             nodes.append(tail)
+        else:
+            # tp = 1: no sequence-parallel window, so nothing closes the block and the combine recvs ARE the tail
+            tail = returned or after_experts
         return LayerEmission(nodes=nodes, tail=tail, kv_ready=kv_ready)
 
     def _emit_masked(self, name, pg_name, attn_flops, attn_bytes, tokens, ep_ctx, key) -> LayerEmission:
@@ -113,12 +119,15 @@ class MoeInferenceLayer(BaseInferenceLayer):
 
         gate = compute(c.gate_flops, c.gate_bytes, parents=[attn_end], name=comp_name(name, "gate"))
         nodes.append(gate)
-        ffw = compute(c.expert_flops, c.expert_bytes, parents=[gate], name=comp_name(name, "ffw"))
-        nodes.append(ffw)
-        comb = compute(c.combine_flops, c.combine_bytes, parents=[ffw], name=comp_name(name, "comb"))
-        nodes.append(comb)
+
+        # skipped when none of this rank's local experts was hit
+        after_experts = gate
+        if c.expert_bytes:
+            ffw = compute(c.expert_flops, c.expert_bytes, parents=[gate], name=comp_name(name, "ffw"))
+            nodes.append(ffw)
+            after_experts = ffw
 
         # every rank holds a PARTIAL of the full output (its experts' contributions only)
-        tail = allreduce(ar_bytes, pg_name=pg_name, parents=[comb], name=coll_name(name, "ffw"))
+        tail = allreduce(ar_bytes, pg_name=pg_name, parents=[after_experts], name=coll_name(name, "ffw"))
         nodes.append(tail)
         return LayerEmission(nodes=nodes, tail=tail, kv_ready=kv_ready)

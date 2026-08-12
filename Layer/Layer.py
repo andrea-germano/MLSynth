@@ -6,11 +6,11 @@ from chakra.schema.protobuf.et_def_pb2 import Node as ChakraNode
 
 @dataclass
 class LayerEmission:
-    """Contract between an inference layer and the orchestrator: `tail` is the last node to
-    chain the per-NPU sequential dependency, `kv_ready` is the node after which the KV cache
-    of this layer exists (hook for the streaming KV transfer)."""
+    """Contract between an inference layer and the orchestrator: `tail` is what the next node on
+    this NPU must depend on, `kv_ready` is the node after which the KV cache of this layer exists
+    `tail` may be a LIST when no single node closes the block: that happens in the MoE layer with tp = 1 and ep > 1 """
     nodes: List[ChakraNode]
-    tail: ChakraNode
+    tail: ChakraNode | List[ChakraNode]
     kv_ready: ChakraNode
 
 
