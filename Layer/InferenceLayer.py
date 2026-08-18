@@ -16,7 +16,7 @@ class InferenceLayer(BaseInferenceLayer):
                 key_value_dim: int | None = None,
                 ffn_intermediate_size: int | None = None,
                 ffn_type: str = "classic",
-                bytes_per_val: int = 2, tp_size: int = 1, scale: float = 1.0):
+                bytes_per_val: int = 2, tp_size: int = 1, scale: float = 1.0, qk_norm: bool = False):
         self.math = DenseBlockMath(
             hidden_size=hidden_size,
             query_dim=query_dim,
@@ -26,6 +26,7 @@ class InferenceLayer(BaseInferenceLayer):
             bytes_per_val=bytes_per_val,
             tp_size=tp_size,
             scale=scale,
+            qk_norm=qk_norm,
         )
         self.hidden_size = hidden_size
         self.bytes_per_val = bytes_per_val

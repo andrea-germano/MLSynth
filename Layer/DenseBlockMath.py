@@ -16,17 +16,13 @@ class DenseBlockMath:
 
     Attention: MHA and GQA (via query_dim / key_value_dim)
     FFN: classic (2 matrix multiplications) or SwiGLU (3 matrix multiplications)
-
-    Exactness rules: the int() casts, the `self.scale *` factors and the `// self.tp_size`
-    divisions must never be moved or factored — downstream traces depend on this exact
-    integer arithmetic. Sums are kept literal (no per-token prefactoring).
     """
 
     def __init__(self, *, hidden_size: int, query_dim: int | None = None,
                  key_value_dim: int | None = None,
                  ffn_intermediate_size: int | None = None,
                  ffn_type: str = "classic",
-                 bytes_per_val: int = 2, tp_size: int = 1, scale: float = 1.0):
+                 bytes_per_val: int = 2, tp_size: int = 1, scale: float = 1.0, qk_norm: bool = False):
         self.hidden_size = hidden_size
         self.query_dim = query_dim if query_dim is not None else hidden_size
         self.key_value_dim = key_value_dim if key_value_dim is not None else hidden_size
@@ -35,6 +31,7 @@ class DenseBlockMath:
         self.bytes_per_val = bytes_per_val
         self.tp_size = tp_size
         self.scale = scale
+        self.qk_norm = qk_norm
 
         self.attn_weight_elems = (
             2 * hidden_size * self.query_dim       # Q proj + O proj
@@ -43,6 +40,8 @@ class DenseBlockMath:
         num_ffn_matrices = 3 if ffn_type == "swiglu" else 2
         self.ffn_weight_elems = num_ffn_matrices * hidden_size * self.ffn_intermediate_size
         self.ffn_flops_per_token = 2 * num_ffn_matrices * hidden_size * self.ffn_intermediate_size
+        # Activation function traffic: SiluAndMul reads 2i and writes i (swiglu); a classic
+        self.act_elems_per_token = (3 if ffn_type == "swiglu" else 2) * self.ffn_intermediate_size
 
     @classmethod
     def from_model_cfg(cls, model_cfg: ModelConfig, tp_size: int) -> "DenseBlockMath":
@@ -55,6 +54,7 @@ class DenseBlockMath:
             bytes_per_val=model_cfg.bytes_per_val,
             tp_size=tp_size,
             scale=model_cfg.scale,
+            qk_norm=model_cfg.qk_norm,
         )
 
     @staticmethod
@@ -62,8 +62,10 @@ class DenseBlockMath:
         """(new_tokens, cached_tokens, score_entries) for a prefill over a batch of requests."""
         new_tokens = sum(prompt_len - cached_len for prompt_len, cached_len in zip(prompt_lens, cached_lens))
         cached_tokens = sum(cached_lens)
-        # Query of the suffix still have to attend to the whole context (cached + new tokens)
-        score_entries = sum((prompt_len - cached_len) * prompt_len for prompt_len, cached_len in zip(prompt_lens, cached_lens))   #? Σ l²: coppie query–key, shouldn't be /2 for causal attention
+        # Causal: the query at absolute position p attends to p+1 keys; summed over the suffix
+        # this is Σ_{p=cached}^{prompt-1}(p+1) = (prompt·(prompt+1) − cached·(cached+1)) / 2.
+        # FlashAttention skips the blocks above the diagonal
+        score_entries = sum((prompt_len * (prompt_len + 1)) // 2 - (cached_len * (cached_len + 1)) // 2 for prompt_len, cached_len in zip(prompt_lens, cached_lens))
         return new_tokens, cached_tokens, score_entries
 
     def attn_costs(self, query_tokens, kv_read_tokens, kv_write_tokens, score_entries) -> Tuple[int, int]:
@@ -78,18 +80,21 @@ class DenseBlockMath:
         b = self.bytes_per_val
 
         flops = int(self.scale * (
-            2 * query_tokens * self.hidden_size * self.query_dim       # Q projection
+            2 * query_tokens * self.hidden_size * self.query_dim  # Q projection
             + 4 * query_tokens * self.hidden_size * self.key_value_dim # K+V projections
-            + 2 * query_tokens * self.query_dim * self.hidden_size     # O projections
-            + 4 * score_entries * self.query_dim                       # QKᵀ + (scores · V)
+            + 2 * query_tokens * self.query_dim * self.hidden_size # O projections
+            + 4 * score_entries * self.query_dim # QKᵀ + (scores · V)
         ) // self.tp_size)
 
         mem = int(self.scale * (
-            self.attn_weight_elems * b // self.tp_size                       # Q,K,V,O weights (sharded)
-            + query_tokens * self.hidden_size * b                            # input activations
-            + 2 * kv_write_tokens * self.key_value_dim * b // self.tp_size   # KV written to cache
-            + 2 * kv_read_tokens * self.key_value_dim * b // self.tp_size    # KV cache already present read
-            + query_tokens * self.hidden_size * b                            # output activations
+            self.attn_weight_elems * b // self.tp_size  # Q,K,V,O weights (sharded)
+            + query_tokens * self.hidden_size * b  # input activations
+            + 2 * kv_write_tokens * self.key_value_dim * b // self.tp_size  # KV written to cache
+            + 2 * kv_read_tokens * self.key_value_dim * b // self.tp_size  # KV cache already present read
+            + query_tokens * self.hidden_size * b  # output activations
+            + 4 * query_tokens * self.hidden_size * b  # RMSNorm x2: read+write h, replicated (tp_stable)
+            + (2 * query_tokens * (self.query_dim + self.key_value_dim) * b // self.tp_size
+               if self.qk_norm else 0) # qk_norm: per-head RMSNorm on Q,K
         ))
         return flops, mem
 
@@ -102,7 +107,8 @@ class DenseBlockMath:
         flops = int(self.scale * (tokens * self.ffn_flops_per_token) // self.tp_size)
         mem = int(self.scale * (
             weight_copies * self.ffn_weight_elems * b // self.tp_size  # FFN weights (sharded)
-            + 2 * tokens * self.hidden_size * b                        # input + output activations
+            + 2 * tokens * self.hidden_size * b  # input + output activations
+            + self.act_elems_per_token * tokens * b // self.tp_size  # act fn: reads [2]i, writes i (sharded)
         ))
         return flops, mem
 

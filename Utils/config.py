@@ -21,6 +21,7 @@ class ModelConfig:
     head_dim: int = 0  #default is hidden_size//num_attention_heads
     intermediate_size: int = 0 #default is 4*hidden_size
     ffn_type: str = "classic" # for now only supported classic or swiglu
+    qk_norm: bool = False # per-head RMSNorm on Q and K before rotary (Qwen3-style)
 
     @property
     def effective_head_dim(self) -> int:
@@ -231,6 +232,7 @@ def _build_model(data: dict) -> ModelConfig:
         head_dim=int(data.get("head_dim", 0)),
         intermediate_size=int(data.get("intermediate_size", 0)),
         ffn_type=ffn_type,
+        qk_norm=bool(data.get("qk_norm", False)),
     )
     if min(cfg.num_layers, cfg.hidden_size, cfg.vocab_size, cfg.bytes_per_val) <= 0:
         raise ValueError("All model parameters must be positive")

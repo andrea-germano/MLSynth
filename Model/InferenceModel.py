@@ -23,6 +23,7 @@ class InferenceModel(BaseInferenceModel):
                 bytes_per_val=model_cfg.bytes_per_val,
                 tp_size=parallelism.tp_size,
                 scale=model_cfg.scale,
+                qk_norm=model_cfg.qk_norm,
             )
             for _ in range(model_cfg.num_layers)
         ]
