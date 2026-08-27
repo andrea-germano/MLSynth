@@ -57,7 +57,7 @@ class MoeRoutingConfig:
     """How the synthesizer stands in for a learned router. These are assumptions, not
     properties of any real system: the router is data-dependent and a static trace cannot be
     reactive, so routing is realised by sampling at synthesis time with a dedicated seed"""
-    distribution: str = "dirichlet"   # dirichlet | uniform
+    distribution: str = "dirichlet"   # dirichlet | dirichlet_shared | uniform
     alpha: float = 1.0  # dirichlet concentration; small = skewed
     seed: int = 0
 
@@ -269,8 +269,9 @@ def _build_moe_routing(data: dict | None, model: ModelConfig) -> MoeRoutingConfi
         alpha=float(data.get("alpha", 1.0)),
         seed=int(data.get("seed", 0)),
     )
-    if cfg.distribution not in ("dirichlet", "uniform"):
-        raise ValueError(f"moe_routing: distribution must be dirichlet/uniform, got {cfg.distribution!r}")
+    if cfg.distribution not in ("dirichlet", "dirichlet_shared", "uniform"):
+        raise ValueError("moe_routing: distribution must be dirichlet/dirichlet_shared/uniform, "
+                         f"got {cfg.distribution!r}")
     if cfg.alpha <= 0:
         raise ValueError("moe_routing: alpha must be > 0")
     return cfg

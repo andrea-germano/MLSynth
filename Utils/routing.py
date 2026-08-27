@@ -22,12 +22,16 @@ class RoutingPlan:
         """Per-expert probability vector, persistent for the whole run.
             - uniform: exactly 1/E everywhere.
             - dirichlet: one draw per layer with concentration alpha (small alpha = skewed). 
-            The popular block rotates from layer to layer, so hotspots are temporally decorrelated
+            The popular block rotates from layer to layer, so hotspots are temporally decorrelated.
+            - dirichlet_shared: ONE draw reused by every layer, so the same experts -- and the
+            EP ranks behind them -- stay hot for the whole forward pass
         """
         E = self.moe.num_experts
         if self.is_uniform():
             return np.full(E, 1.0 / E)
-        rng = np.random.default_rng([self.routing.seed, _POP_NS, layer])
+        # dropping `layer` from the seed is what makes the draw shared by the whole model
+        layer_key = 0 if self.routing.distribution == "dirichlet_shared" else layer
+        rng = np.random.default_rng([self.routing.seed, _POP_NS, layer_key])
         return rng.dirichlet(self.routing.alpha * np.ones(E))
 
     # Level 2: per-key token draws (stochastic skew)
