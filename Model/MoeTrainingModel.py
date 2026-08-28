@@ -13,91 +13,60 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from Model.Model import BaseTrainingModel
-from Layer.MoeTrainingLayer import MoeTrainingLayer
-from Utils.config import TrainRunConfig
+from Model.Model import Model
+from Layer.MoeTrainingLayer import TransformerMoeLayer
 from chakra.schema.protobuf.et_def_pb2 import (
     Node as ChakraNode,
+    NodeType as ChakraNodeType,
+    AttributeProto as ChakraAttr
 )
 
 
-class MoeTrainingModel(BaseTrainingModel):
-    """Mixture-of-Experts transformer model for training"""
+class TransformerMoe(Model):
+    """A concrete implementation of the Model interface."""
+    
+    def __init__(self, 
+        num_layers: int, 
+        hidden_size: int, 
+        sequence_len: int, 
+        vocab_size: int, 
+        batch_size: int, 
+        bytes_per_val: int,
+        ep_size: int,
+        tp_size: int, 
+        scale: float = 1,
+        name="transformer"):
+        self.name = name
+        self.num_layers = num_layers
+        self.hidden_size = hidden_size
+        self.sequence_len = sequence_len
+        self.vocab_size = vocab_size
+        self.batch_size = batch_size
+        self.bytes_per_val = bytes_per_val
+        self.ep_size = ep_size
+        self.tp_size = tp_size
+        self.scale = scale
+        self.num_params = 12 * num_layers * hidden_size * hidden_size * (1 + ((13)/(12*num_layers*hidden_size)) + ((vocab_size + sequence_len)/(12*num_layers*hidden_size)))
 
-    def __init__(self, run: TrainRunConfig):
-        self._model_cfg = run.model
-        self._training = run.training
-        self._tp_size = run.parallelism.tp_size
-        self.moe = run.model.moe
+        # Model is composed of layers
+        self.layers = []
 
-        self.layers = [
-            MoeTrainingLayer(
-                model_cfg=run.model,
-                sequence_len=run.training.sequence_len,
-                tp_size=run.parallelism.tp_size,
-                ep_size=run.parallelism.ep,
-            )
-            for _ in range(run.model.num_layers)
-        ]
-
-    def fwd(self, name, npu_id, layer, num_batches, pg_name=None, microbatch: int = 0) -> list[ChakraNode]:
-        return self._layer_for(layer).fwd(name=name, num_batches=num_batches, pg_name=pg_name)
-
-    def bckwd(self, name, npu_id, layer, num_batches, pg_name=None, microbatch: int = 0) -> list[ChakraNode]:
-        return self._layer_for(layer).bckwd(name=name, num_batches=num_batches, pg_name=pg_name)
-
-    def _layer_for(self, idx: int) -> MoeTrainingLayer:
-        return self.layers[idx]
-
-    def get_layers(self) -> list[MoeTrainingLayer]:
-        return self.layers
-
-    @property
-    def model_cfg(self):
-        return self._model_cfg
-
-    @property
-    def expert_params(self) -> float:
-        """FFN weights of every expert, over all layers."""
-        return float(sum(layer.math.ffn_weight_elems for layer in self.layers) * self.moe.num_experts)
-
-    @property
-    def num_params(self) -> float:
-        """Counted, not approximated, and the experts are in it: the whole model goes through
-        the single DP all-reduce, since no expert-DP group is modelled."""
-        d, L, V = self._model_cfg.hidden_size, self._model_cfg.num_layers, self._model_cfg.vocab_size
-        attn_weights = sum(layer.math.attn_weight_elems for layer in self.layers)
-        router = L * d * self.moe.num_experts
-        embedding = 2 * V * d  # embedding + lm head
-        norms = (2 * L + 1) * d
-        return float(attn_weights + router + embedding + norms) + self.expert_params
-
-    def get_num_params(self) -> float:
-        return self.num_params
-
-    def get_num_layers(self) -> int:
-        return self._model_cfg.num_layers
-
-    def get_name(self) -> str:
-        return self._model_cfg.name
-
-    def get_hidden_size(self) -> int:
-        return self._model_cfg.hidden_size
-
-    def get_sequence_len(self) -> int:
-        return self._training.sequence_len
-
-    def get_vocab_size(self) -> int:
-        return self._model_cfg.vocab_size
-
-    def get_batch_size(self) -> int:
-        return self._training.batch_size
-
-    def get_bytes_per_val(self) -> int:
-        return self._model_cfg.bytes_per_val
-
-    def get_tp_size(self) -> int:
-        return self._tp_size
-
-    def get_scale(self) -> float:
-        return self._model_cfg.scale
+        [self.layers.append(
+            TransformerMoeLayer(
+                num_layers=num_layers,
+                hidden_size=hidden_size,
+                sequence_len=sequence_len,
+                vocab_size=vocab_size,
+                ep_size=ep_size,
+                tp_size=tp_size,
+                bytes_per_val=bytes_per_val,
+                scale=scale)) for i in range(num_layers)]
+    
+    #def get_next_layer(self) -> list[ChakraNode]:
+    #    return self.layers[0]
+    
+    def fwd(self, name, layer, num_batches) -> list[ChakraNode]:
+        return self.layers[layer].fwd(name=name, num_batches=num_batches)
+    
+    def bckwd(self, name, layer, num_batches) -> list[ChakraNode]:
+        return self.layers[layer].bckwd(name=name, num_batches=num_batches)
