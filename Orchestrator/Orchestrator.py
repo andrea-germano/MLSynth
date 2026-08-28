@@ -17,15 +17,12 @@ from abc import ABC, abstractmethod
 
 
 class Orchestrator(ABC):
-    """Interface for an orchestrator that schedules a model over a set of NPUs and emits the
-    per-NPU Chakra node lists (both for training and inference)."""
+    """Interface for an orchestrator that schedules a model over a set of NPUs and emits the per-NPU Chakra node lists (both for training and inference)."""
 
     @abstractmethod
     def generate_comm_groups(self) -> dict:
-        """Return {pg_name: [npu_id, ...]} for every process group used by the emitted nodes."""
         raise NotImplementedError
 
     @abstractmethod
     def exec(self) -> dict:
-        """Return {npu_id: [GlobalMetadata, ChakraNode, ...]} for the whole run."""
         raise NotImplementedError

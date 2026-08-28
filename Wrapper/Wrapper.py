@@ -21,16 +21,11 @@ from Layer.Layer import LayerEmission
 
 
 class BaseWrapper(ABC):
-    """Base class for decorators around a model (a BaseTrainingModel or BaseInferenceModel
-    implementation). A wrapper intercepts the emission methods of both modes (fwd/bckwd for
-    training, prefill/decode for inference) to alter the emitted graph.
-
-    Every other attribute is delegated to the wrapped model, so orchestrators can use a
-    wrapped model transparently (num_params, getters, model_cfg, with_parallelism, ...).
+    """Base class for decorators around a model. A wrapper intercepts the emission methods of both modes 
+    (fwd/bckwd for training, prefill/decode for inference) to alter the emitted graph.
     """
 
     def __init__(self, model):
-        # assign before anything else: __getattr__ delegates to self.model
         self.model = model
 
     def __getattr__(self, item):

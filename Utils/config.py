@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
@@ -6,8 +21,7 @@ import yaml
 
 @dataclass(frozen=True)
 class ModelConfig:
-    """Architectural model description. A single instance is shared between prefill and decode in
-      disaggregation since the underlying architecture is identical, only the parallelism strategy may differ"""
+    """Architectural model description"""
     name: str
     num_layers: int
     hidden_size: int
@@ -47,18 +61,13 @@ class MoeConfig:
     """Mixture-of-experts configuration for training and inference"""
     num_experts: int
     top_k: int = 1 #dispatch volume per token, default is 1
-    # Training only: the expert buffers are sized for this multiple of the average load, and
-    # that fixed capacity is what sizes the all-to-all (the training block has no router).
-    # Inference ignores it: there the volume comes from the sampled routing itself.
     capacity_factor: float = 1.25
 
 @dataclass(frozen=True)
 class MoeRoutingConfig:
-    """How the synthesizer stands in for a learned router. These are assumptions, not
-    properties of any real system: the router is data-dependent and a static trace cannot be
-    reactive, so routing is realised by sampling at synthesis time with a dedicated seed"""
+    """How the synthesizer stands in for a learned router"""
     distribution: str = "dirichlet"   # dirichlet | dirichlet_shared | uniform
-    alpha: float = 1.0  # dirichlet concentration; small = skewed
+    alpha: float = 1.0 
     seed: int = 0
 
     @property
@@ -68,15 +77,10 @@ class MoeRoutingConfig:
 @dataclass(frozen=True) 
 class ParallelismConfig:
     """Tensor-, pipeline- and data-parallel degrees. Shared by training and inference.
-
-    Expert mesh (MoE Parallel Folding over the tp*dp devices of a stage): experts are always kept WHOLE (etp = 1) and ep spans the full stage:
-      - INFERENCE always derives ep = tp*dp (one cluster, no expert replicas)
-      - TRAINING accepts ep_size as an on/off switch for the all-to-all, which is the original's behaviour
-    DP in inference is only meaningful for MoE models, for dense models it would only produce independent replicas with identical traces, so it is rejected there"""
+      DP in inference is only meaningful for MoE models, for dense models it would only produce independent replicas with identical traces, so it is rejected there"""
     tp_size: int = 1
     pp_size: int = 1
     dp_size: int = 1
-    ep_size: int = 0 #0= default, derive as tp*dp
 
     @property
     def num_npus(self) -> int:
@@ -123,14 +127,7 @@ class SlowdownSpec:
 
 @dataclass(frozen=True)
 class WrapperCondition:
-    """Selects the (npu, layer, phase) combinations a slowdown applies to. Unset fields match everything.
-
-    npu_id/npu_id_range refer to the GLOBAL NPU id, with the same semantics in both modes:
-    - training (MegatronLM): npu_id = pp_stage*(dp_size*tp_size) + dp_group*tp_size + tp_shard
-      (Megatron rank order tp-dp-pp: each pipeline stage is a contiguous block)
-    - inference (DisaggregatedInference): the prefill pool occupies ids [0, prefill_npus),
-      the decode pool ids [prefill_npus, prefill_npus + decode_npus)
-    layer_id/layer_id_range refer to the global layer index in both modes."""
+    """Selects the (npu, layer, phase) combinations a slowdown applies to"""
     slowdown: SlowdownSpec
     npu_id: int | None = None
     npu_id_range: tuple[int, int] | None = None
@@ -277,8 +274,7 @@ def _build_moe_routing(data: dict | None, model: ModelConfig) -> MoeRoutingConfi
     return cfg
 
 def load_config(path: str | Path):
-    """Load a YAML config and dispatch on its mode: a top-level `inference` block yields a
-    RunConfig, a top-level `training` block yields a TrainRunConfig."""
+    """Load a YAML config and dispatch on its mode: a top-level `inference` block yields a RunConfig, a top-level `training` block yields a TrainRunConfig."""
     with open(path, "r") as f:
         data = yaml.safe_load(f)
     has_inference = "inference" in data

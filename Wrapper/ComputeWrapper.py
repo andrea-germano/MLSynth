@@ -37,8 +37,6 @@ class ComputeWrapper(BaseWrapper):
         self.rng = np.random.default_rng(wrapper_cfg.seed)
 
     def with_parallelism(self, parallelism: ParallelismConfig) -> "ComputeWrapper":
-        # each derived view gets a fresh RNG seeded with the same seed: deterministic,
-        # but prefill/decode pools draw from independent identically-seeded streams
         return ComputeWrapper(self.model.with_parallelism(parallelism), self.wrapper_cfg)
 
     # ------------- training -------------
@@ -73,7 +71,7 @@ class ComputeWrapper(BaseWrapper):
             emission = self._apply_to_emission(emission, self._slowdown_factor(condition))
         return emission
 
-    # ------------- slowdown machinery -------------
+    # ------------- slowdowns -------------
 
     def should_slowdown(self, npu_id: int, layer: int) -> Optional[WrapperCondition]:
         for condition in self.wrapper_cfg.conditions:
@@ -88,13 +86,11 @@ class ComputeWrapper(BaseWrapper):
         return self.rng.normal(spec.mean, spec.std)
 
     def _insert_slowdown(self, ops: List[ChakraNode], slowdown: float) -> Tuple[List[ChakraNode], dict]:
-        """Insert after every COMP_NODE a slowdown compute node scaled by `slowdown`.
-        Returns the updated list and a map {original comp node id -> slowdown node}."""
+        """Insert after every COMP_NODE a slowdown compute node scaled by `slowdown`. Returns the updated list and a map"""
         replaced: dict[int, ChakraNode] = {}
         if slowdown <= 0:
             return ops, replaced
 
-        # Iterate in reverse order to avoid index issues when inserting elements
         for i in range(len(ops) - 1, -1, -1):
             op = ops[i]
             if op.type == ChakraNodeType.COMP_NODE:
@@ -113,11 +109,9 @@ class ComputeWrapper(BaseWrapper):
         return ops, replaced
 
     def _apply_to_emission(self, emission: LayerEmission, slowdown: float) -> LayerEmission:
-        """Apply the slowdown to a LayerEmission, retargeting tail/kv_ready when the node they
-        point to gained a trailing slowdown node (otherwise KV/PP sends would not wait for it)."""
+        """Apply the slowdown to a LayerEmission, retargeting tail/kv_ready when the node they point to gained a trailing slowdown node"""
         nodes, replaced = self._insert_slowdown(list(emission.nodes), slowdown)
         tail = emission.tail
-        # A LIST tail is the combine recvs of a tp=1 MoE block (see LayerEmission)
         return LayerEmission(
             nodes=nodes,
             tail=tail if isinstance(tail, list) else replaced.get(tail.id, tail),
