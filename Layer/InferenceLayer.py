@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import List
 from chakra.schema.protobuf.et_def_pb2 import Node as ChakraNode
 
@@ -8,15 +23,10 @@ from Utils.naming import comp_name, coll_name
 
 
 class InferenceLayer(BaseInferenceLayer):
-    """A single dense inference block, accounting for FLOPs and activations of a single
-    transformer layer, for both prefill and decode phases.
-    The cost model lives in DenseBlockMath (shared with the training layer)."""
+    """A single dense inference block, accounting for FLOPs and activations of a single transformer layer"""
 
-    def __init__(self, hidden_size: int, query_dim: int | None = None,
-                key_value_dim: int | None = None,
-                ffn_intermediate_size: int | None = None,
-                ffn_type: str = "classic",
-                bytes_per_val: int = 2, tp_size: int = 1, scale: float = 1.0, qk_norm: bool = False):
+    def __init__(self, hidden_size: int, query_dim: int | None = None, key_value_dim: int | None = None, ffn_intermediate_size: int | None = None, ffn_type: str = "classic", 
+                 bytes_per_val: int = 2, tp_size: int = 1, scale: float = 1.0, qk_norm: bool = False):
         self.math = DenseBlockMath(
             hidden_size=hidden_size,
             query_dim=query_dim,
@@ -44,23 +54,17 @@ class InferenceLayer(BaseInferenceLayer):
     def prefill(self, name: str, pg_name: str | None, prompt_lens: List[int], cached_lens: List[int]) -> LayerEmission:
         new_tokens, cached_tokens, score_entries = DenseBlockMath.prefill_counts(prompt_lens, cached_lens)
 
-        attn_flops, attn_bytes = self.math.attn_costs(
-            query_tokens=new_tokens, kv_read_tokens=cached_tokens,
-            kv_write_tokens=new_tokens, score_entries=score_entries)
+        attn_flops, attn_bytes = self.math.attn_costs(query_tokens=new_tokens, kv_read_tokens=cached_tokens, kv_write_tokens=new_tokens, score_entries=score_entries)
         ffn_flops, ffn_bytes = self.math.ffn_costs(new_tokens)
 
-        return self._emit(name, pg_name, attn_flops, attn_bytes, ffn_flops, ffn_bytes,
-                          allreduce_tokens=new_tokens)
+        return self._emit(name, pg_name, attn_flops, attn_bytes, ffn_flops, ffn_bytes, allreduce_tokens=new_tokens)
 
     def decode(self, name: str, pg_name: str | None, kv_lens: List[int]) -> LayerEmission:
-        """Emit a single decode step. `kv_lens[i]` is the length of request i's KV cache
-        *including* the token produced in this step."""
+        """Emit a single decode step. `kv_lens[i]` is the length of request i's KV cache"""
         batch_size = len(kv_lens)
         total_kv_tokens = sum(kv_lens)
 
-        attn_flops, attn_bytes = self.math.attn_costs(
-            query_tokens=batch_size, kv_read_tokens=total_kv_tokens,
-            kv_write_tokens=batch_size, score_entries=total_kv_tokens)
+        attn_flops, attn_bytes = self.math.attn_costs(query_tokens=batch_size, kv_read_tokens=total_kv_tokens, kv_write_tokens=batch_size, score_entries=total_kv_tokens)
         ffn_flops, ffn_bytes = self.math.ffn_costs(batch_size)
 
         return self._emit(name, pg_name, attn_flops, attn_bytes, ffn_flops, ffn_bytes, allreduce_tokens=batch_size)

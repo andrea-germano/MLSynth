@@ -22,7 +22,7 @@ from chakra.schema.protobuf.et_def_pb2 import (
 
 
 class TrainingModel(BaseTrainingModel):
-    """Dense transformer model for training."""
+    """Implementation of the Transformer training model."""
 
     def __init__(self, run: TrainRunConfig):
         self._model_cfg = run.model
@@ -39,13 +39,10 @@ class TrainingModel(BaseTrainingModel):
         ]
 
     def fwd(self, name, npu_id, layer, num_batches, pg_name=None, microbatch=0) -> list[ChakraNode]:
-        return self._layer_for(layer).fwd(name=name, num_batches=num_batches, pg_name=pg_name)
+        return self.layers[layer].fwd(name=name, num_batches=num_batches, pg_name=pg_name)
 
     def bckwd(self, name, npu_id, layer, num_batches, pg_name=None, microbatch=0) -> list[ChakraNode]:
-        return self._layer_for(layer).bckwd(name=name, num_batches=num_batches, pg_name=pg_name)
-
-    def _layer_for(self, idx: int) -> TrainingLayer:
-        return self.layers[idx]
+        return self.layers[layer].bckwd(name=name, num_batches=num_batches, pg_name=pg_name)
 
     def get_layers(self) -> list[TrainingLayer]:
         return self.layers

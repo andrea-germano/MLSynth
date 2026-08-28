@@ -106,8 +106,8 @@ def alltoall(coll_size: int, pg_name: Optional[str] = None, name: str = "COMM_CO
     return node
 
 def reduce_scatter(coll_size: int, pg_name: Optional[str] = None, name: str = "COMM_COLL_NODE_Reduce-Scatter", parents: Optional[List[ChakraNode]] = None) -> ChakraNode:
-    """Half of a ring all-reduce: reduce, then keep only this rank's slice.
-    `coll_size` is the WHOLE tensor, the same convention as `allreduce`"""
+    """Half of a ring all-reduce: reduce, then keep only this rank's slice"""
+    #! `coll_size` is the WHOLE tensor, the same convention as `allreduce`
     node = get_node(name, COMM_COLL_NODE)
     node.attr.append(ChakraAttr(name="is_cpu_op", bool_val=False))
     node.attr.append(ChakraAttr(name="comm_type", int64_val=REDUCE_SCATTER))
@@ -118,8 +118,8 @@ def reduce_scatter(coll_size: int, pg_name: Optional[str] = None, name: str = "C
     return node
 
 def all_gather(coll_size: int, pg_name: Optional[str] = None, name: str = "COMM_COLL_NODE_All-Gather", parents: Optional[List[ChakraNode]] = None) -> ChakraNode:
-    """The other half: every rank's slice, gathered back into the whole tensor.
-    `coll_size` is THIS RANK'S SHARD, not the whole tensor"""
+    """The other half: every rank's slice, gathered back into the whole tensor"""
+    #! `coll_size` is THIS RANK'S SHARD in the astra-sim implementation, not the whole tensor
     node = get_node(name, COMM_COLL_NODE)
     node.attr.append(ChakraAttr(name="is_cpu_op", bool_val=False))
     node.attr.append(ChakraAttr(name="comm_type", int64_val=ALL_GATHER))
@@ -130,8 +130,7 @@ def all_gather(coll_size: int, pg_name: Optional[str] = None, name: str = "COMM_
     return node
 
 def alltoall_v(matrix, peers: List[int], ep_rank: int, *, size_for, name_for, parents: Optional[List[ChakraNode]] = None):
-    """Emit an ASYMMETRIC all-to-all: this rank's row as SENDs and its column as RECVs.
-    The diagonal is skipped (local payload never hits the network) and so are empty edges. Returns (all emitted nodes, the RECVs)"""
+    """Emit an ASYMMETRIC all-to-all. Returns (all emitted nodes, the RECVs)"""
     nodes, recvs = [], []
     for peer in range(len(peers)):
         if peer == ep_rank:

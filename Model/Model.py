@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import List
@@ -8,11 +23,10 @@ from Utils.config import ModelConfig, ParallelismConfig
 
 
 class BaseTrainingModel(ABC):
-    """Interface for a training-mode model composed of training layers.
+    """Interface for a training-mode model composed of layers.
 
-    The orchestrator uses fwd/bckwd to fetch computation and communication operations at
-    each layer. `npu_id` identifies the emitting NPU; it is unused by plain models but
-    consumed by wrappers (e.g. per-NPU slowdowns)."""
+    The Model interface provides functions that the orchestrator uses
+    to fetch computation and communication operations at each layer."""
 
     @abstractmethod
     def fwd(self, name: str, npu_id: int, layer: int, num_batches: float, pg_name: str | None = None, microbatch: int = 0) -> List[ChakraNode]:
@@ -27,7 +41,7 @@ class BaseTrainingModel(ABC):
     @property
     @abstractmethod
     def num_params(self) -> float:
-        """Whole-model parameter count. Sizes the DP gradient all-reduce."""
+        """Whole-model parameter count."""
         raise NotImplementedError
 
 
@@ -45,7 +59,7 @@ class BaseInferenceModel(ABC):
 
     @abstractmethod
     def with_parallelism(self, parallelism: ParallelismConfig) -> "BaseInferenceModel":
-        """Return a view of this model with a different parallelism config but the SAME (by identity) ModelConfig."""
+        """Return a view of this model with a different parallelism config but the SAME ModelConfig."""
         raise NotImplementedError
 
     @property

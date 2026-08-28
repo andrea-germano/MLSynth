@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import List
 
 from Model.Model import BaseInferenceModel
@@ -6,13 +21,12 @@ from Layer.InferenceLayer import InferenceLayer
 from Utils.config import ModelConfig, ParallelismConfig
 
 class InferenceModel(BaseInferenceModel):
-    """Dense transformer model for inference. A single instance is shared between prefill and
-    decode pools; `with_parallelism` derives per-pool views over the same ModelConfig."""
+    """Dense transformer model for inference. A single instance is shared between prefill and decode pools; 
+    `with_parallelism` derives per-pool views over the same ModelConfig."""
 
     def __init__(self, model_cfg: ModelConfig, parallelism: ParallelismConfig = ParallelismConfig()):
         self._model_cfg = model_cfg
         self._parallelism = parallelism
-        # Model is composed of inference layers, one instance per layer
         self.layers = [
             InferenceLayer(
                 hidden_size=model_cfg.hidden_size,
@@ -33,13 +47,10 @@ class InferenceModel(BaseInferenceModel):
         return InferenceModel(self._model_cfg, parallelism)
 
     def prefill(self, name: str, npu_id: int, layer: int, prompt_lens: List[int], cached_lens: List[int], pg_name: str | None = None) -> LayerEmission:
-        return self._layer_for(layer).prefill(name=name, pg_name=pg_name, prompt_lens=prompt_lens, cached_lens=cached_lens)
+        return self.layers[layer].prefill(name=name, pg_name=pg_name, prompt_lens=prompt_lens, cached_lens=cached_lens)
 
     def decode(self, name: str, npu_id: int, layer: int, kv_lens: List[int], pg_name: str | None = None) -> LayerEmission:
-        return self._layer_for(layer).decode(name=name, pg_name=pg_name, kv_lens=kv_lens)
-
-    def _layer_for(self, idx: int) -> InferenceLayer:
-        return self.layers[idx]
+        return self.layers[layer].decode(name=name, pg_name=pg_name, kv_lens=kv_lens)
 
     def get_layers(self) -> list[InferenceLayer]:
         return self.layers

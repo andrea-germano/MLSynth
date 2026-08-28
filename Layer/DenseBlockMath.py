@@ -1,27 +1,32 @@
-from typing import List, Tuple
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
+from typing import List, Tuple
 from Utils.config import ModelConfig
 
 # With tensor parallelism, each TP rank does 1/tp of the FLOPs and holds 1/tp of the weights, but 2 all reduce operations
 # are required per layer (after output projection and FFW down projection) to reassemble the partial sums.
-# Q,K,V,O matrices are each of size d*d/tp per TP rank and the MLP up and down projection matrices are 4d^2/tp each
-# K and V are produced by column-parallel projections, so each TP rank stores 1/tp slice of the KV cache
 
-#! It is supposed that a method like flash attention is used, since with a naive attention implementation the memory access for the attention scores would be much higher
-
+#! It is supposed that a method like flash attention is used
 
 class DenseBlockMath:
-    """Single source of truth for the FLOP/byte cost model of one dense transformer block
-    (attention + FFN), shared by the training and inference layers.
-
-    Attention: MHA and GQA (via query_dim / key_value_dim)
-    FFN: classic (2 matrix multiplications) or SwiGLU (3 matrix multiplications)
+    """Single source of truth for the FLOP/byte cost model of one dense transformer block (attention + FFN), shared by the training and inference layers.
     """
 
-    def __init__(self, *, hidden_size: int, query_dim: int | None = None,
-                 key_value_dim: int | None = None,
-                 ffn_intermediate_size: int | None = None,
-                 ffn_type: str = "classic",
+    # FFN: classic (2 matrix multiplications) or SwiGLU (3 matrix multiplications)
+    def __init__(self, *, hidden_size: int, query_dim: int | None = None, key_value_dim: int | None = None, ffn_intermediate_size: int | None = None, ffn_type: str = "classic",
                  bytes_per_val: int = 2, tp_size: int = 1, scale: float = 1.0, qk_norm: bool = False):
         self.hidden_size = hidden_size
         self.query_dim = query_dim if query_dim is not None else hidden_size
@@ -40,7 +45,6 @@ class DenseBlockMath:
         num_ffn_matrices = 3 if ffn_type == "swiglu" else 2
         self.ffn_weight_elems = num_ffn_matrices * hidden_size * self.ffn_intermediate_size
         self.ffn_flops_per_token = 2 * num_ffn_matrices * hidden_size * self.ffn_intermediate_size
-        # Activation function traffic: SiluAndMul reads 2i and writes i (swiglu); a classic
         self.act_elems_per_token = (3 if ffn_type == "swiglu" else 2) * self.ffn_intermediate_size
 
     @classmethod
@@ -63,16 +67,12 @@ class DenseBlockMath:
         new_tokens = sum(prompt_len - cached_len for prompt_len, cached_len in zip(prompt_lens, cached_lens))
         cached_tokens = sum(cached_lens)
         # Causal: the query at absolute position p attends to p+1 keys; summed over the suffix
-        # this is Σ_{p=cached}^{prompt-1}(p+1) = (prompt·(prompt+1) − cached·(cached+1)) / 2.
-        # FlashAttention skips the blocks above the diagonal
         score_entries = sum((prompt_len * (prompt_len + 1)) // 2 - (cached_len * (cached_len + 1)) // 2 for prompt_len, cached_len in zip(prompt_lens, cached_lens))
         return new_tokens, cached_tokens, score_entries
 
     def attn_costs(self, query_tokens, kv_read_tokens, kv_write_tokens, score_entries) -> Tuple[int, int]:
         """(flops, bytes) of the attention block.
-
-        query_tokens:    tokens projected through Q/K/V/O (prefill: new tokens; decode: batch size;
-                         training fwd: microbatch tokens — may be a float)
+        query_tokens:    tokens projected through Q/K/V/O (prefill: new tokens; decode: batch size; training: microbatch tokens)
         kv_read_tokens:  tokens whose K,V are read from the cache (0 when nothing is cached)
         kv_write_tokens: tokens whose K,V are produced/written
         score_entries:   query-key pairs in QKᵀ / scores·V
@@ -93,25 +93,23 @@ class DenseBlockMath:
             + 2 * kv_read_tokens * self.key_value_dim * b // self.tp_size  # KV cache already present read
             + query_tokens * self.hidden_size * b  # output activations
             + 4 * query_tokens * self.hidden_size * b  # RMSNorm x2: read+write h, replicated (tp_stable)
-            + (2 * query_tokens * (self.query_dim + self.key_value_dim) * b // self.tp_size
-               if self.qk_norm else 0) # qk_norm: per-head RMSNorm on Q,K
+            + (2 * query_tokens * (self.query_dim + self.key_value_dim) * b // self.tp_size if self.qk_norm else 0)
         ))
         return flops, mem
 
     def ffn_costs(self, tokens, weight_copies: int = 1) -> Tuple[int, int]:
         """(flops, bytes) of the FFN block for the given number of tokens.
-
-        weight_copies: how many FFN weight sets this device READS (1 for dense; for an MoE
-        block the local experts actually hit by >=1 token, whole experts, tp_size=1)."""
+        tokens: how many tokens are processed by this device
+        weight_copies: how many FFN weight sets this device READS"""
         b = self.bytes_per_val
         flops = int(self.scale * (tokens * self.ffn_flops_per_token) // self.tp_size)
         mem = int(self.scale * (
             weight_copies * self.ffn_weight_elems * b // self.tp_size  # FFN weights (sharded)
             + 2 * tokens * self.hidden_size * b  # input + output activations
-            + self.act_elems_per_token * tokens * b // self.tp_size  # act fn: reads [2]i, writes i (sharded)
+            + self.act_elems_per_token * tokens * b // self.tp_size
         ))
         return flops, mem
 
     def allreduce_bytes(self, tokens) -> int:
-        """Size of each of the two TP all-reduces (after O projection and FFN down projection)."""
+        """Size of each of the two TP all-reduces"""
         return int(self.scale * tokens * self.hidden_size * self.bytes_per_val)

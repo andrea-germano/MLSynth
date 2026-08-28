@@ -23,8 +23,7 @@ from chakra.schema.protobuf.et_def_pb2 import (
 
 
 class TrainingLayer(BaseTrainingLayer):
-    """A single dense training block. The cost model lives in DenseBlockMath, shared with the
-    inference layer; the backward is 2x the forward FLOPs, in reverse order."""
+    """An implementation of a single dense training layer"""
 
     def __init__(self, model_cfg: ModelConfig, sequence_len: int, tp_size: int):
         self.math = DenseBlockMath.from_model_cfg(model_cfg, tp_size)
@@ -33,20 +32,15 @@ class TrainingLayer(BaseTrainingLayer):
 
     def _costs(self, num_batches):
         tokens = num_batches * self.sequence_len
-        # every query attends to the full sequence (no /2 causal factor)
         score_entries = num_batches * self.sequence_len * self.sequence_len
-        attn_flops, attn_bytes = self.math.attn_costs(
-            query_tokens=tokens, kv_read_tokens=0,
-            kv_write_tokens=tokens, score_entries=score_entries)
+        attn_flops, attn_bytes = self.math.attn_costs(query_tokens=tokens, kv_read_tokens=0, kv_write_tokens=tokens, score_entries=score_entries)
         ffn_flops, ffn_bytes = self.math.ffn_costs(tokens)
         return attn_flops, attn_bytes, ffn_flops, ffn_bytes, self.math.allreduce_bytes(tokens)
 
     def fwd(self, name="node_fwd", pg_name=None, num_batches=1) -> list[ChakraNode]:
         attn_flops, attn_bytes, ffn_flops, ffn_bytes, tp_comm_size = self._costs(num_batches)
-
         attention_compute = compute(attn_flops, attn_bytes, name=f"{name}_attention_compute")
 
-        # tensor parallel allreduce
         attention_allreduce = None
         if self.tp_size > 1:
             attention_allreduce = allreduce(tp_comm_size, pg_name=pg_name, parents=[attention_compute], name=f"{name}_attention_allreduce")
@@ -54,7 +48,6 @@ class TrainingLayer(BaseTrainingLayer):
         ffwd_parent = [attention_allreduce] if attention_allreduce else [attention_compute]
         ffwd_compute = compute(ffn_flops, ffn_bytes, parents=ffwd_parent, name=f"{name}_ffwd_compute")
 
-        # tensor parallel allreduce
         ffwd_allreduce = None
         if self.tp_size > 1:
             ffwd_allreduce = allreduce(tp_comm_size, pg_name=pg_name, parents=[ffwd_compute], name=f"{name}_mlp_allreduce")
@@ -67,13 +60,10 @@ class TrainingLayer(BaseTrainingLayer):
             nodes.append(ffwd_allreduce)
         return nodes
 
-
     def bckwd(self, name="node_bckwd", pg_name=None, num_batches=1) -> list[ChakraNode]:
         attn_flops, attn_bytes, ffn_flops, ffn_bytes, tp_comm_size = self._costs(num_batches)
-
         ffwd_compute = compute(2 * ffn_flops, ffn_bytes, name=f"{name}_ffwd_compute")
 
-        # tensor parallel allreduce
         ffwd_allreduce = None
         if self.tp_size > 1:
             ffwd_allreduce = allreduce(tp_comm_size, pg_name=pg_name, parents=[ffwd_compute], name=f"{name}_mlp_allreduce")
@@ -81,7 +71,6 @@ class TrainingLayer(BaseTrainingLayer):
         attention_parent = [ffwd_allreduce] if ffwd_allreduce else [ffwd_compute]
         attention_compute = compute(2 * attn_flops, tensor_size=attn_bytes, parents=attention_parent, name=f"{name}_attention_compute")
 
-        # tensor parallel allreduce
         attention_allreduce = None
         if self.tp_size > 1:
             attention_allreduce = allreduce(tp_comm_size, pg_name=pg_name, parents=[attention_compute], name=f"{name}_attention_allreduce")
