@@ -30,7 +30,6 @@ from Utils.config import TrainRunConfig, load_config
 from Utils.nodes import attr_val
 from Model.TrainingModel import TrainingModel
 from Model.InferenceModel import InferenceModel
-from Model.MoeTrainingModel import MoeTrainingModel
 from Model.MoeInferenceModel import MoeInferenceModel
 from Wrapper.ComputeWrapper import ComputeWrapper
 from Orchestrator.MegatronLM import MegatronLM
@@ -86,9 +85,10 @@ def main(argv=None) -> int:
     if training:
         m, p, t = run.model, run.parallelism, run.training
         name = f"{m.name}_{p.dp_size}dp_{p.pp_size}pp_{p.tp_size}tp_{t.batch_size}B_{t.sequence_len}S_{m.vocab_size}V_{m.hidden_size}d_{m.bytes_per_val}b_{int(m.scale*100)}scale"
-        if moe:
-            name += f"_{p.ep}ep_{m.moe.num_experts}E"
-        model = MoeTrainingModel(run) if moe else TrainingModel(run)
+        # if moe:
+        #     name += f"_{p.ep}ep_{m.moe.num_experts}E"
+        #! TrainRunConfig refuses model.moe, so training is the dense path alone;
+        model = TrainingModel(run)
     else:
         name = run.model.name
         # per-run auto-name, kept for reference:

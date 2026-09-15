@@ -11,14 +11,11 @@ from Layer.Layer import MoeEpContext
 from Utils.routing import PHASE_DECODE, PHASE_PREFILL
 from Utils.naming import (comp_base, pp_name, kv_name, firsttok_name, decfb_name, comm_tag)
 
-# size of bytes of the sampled token feedback (used for serialization of decode iterations and for the first token handoff from prefill to decode)
-#! Maybe this should be calculated as the size of lm_head * bytes_per_val * scale, to more accurately reflect the size of the autoregressive feedback, but for now we keep it fixed and small as it is only used for synchronization and does not carry actual data in this model of the system.
-SAMPLE_BYTES = 8
+SAMPLE_BYTES = 8 # size of bytes of the sampled token feedback (used for serialization of decode iterations and for the first token handoff from prefill to decode)
 
 class DisaggregatedInference(Orchestrator):
     """Separate pool for prefill and decode to model a disaggregated inference system where prefill and decode can be executed on different hardware.
-    Each pool can have its own TP and PP topology. The KV cache is transferred with a streaming mechanism: each layer can send its KV cache to the decode pool
-    asynchronously as soon as it is produced in the prefill phase, overlapping comms with computation of next layer"""
+    Each pool can have its own TP and PP topology."""
 
     #Prefill pool: NPU ids [0, num_prefill_npus),
     #Decode pool: NPU ids [num_prefill_npus, num_prefill_npus + num_decode_npus)
@@ -26,17 +23,15 @@ class DisaggregatedInference(Orchestrator):
     def __init__(self, model: BaseInferenceModel, run: InferenceRunConfig):
         self.run = run
         self.model = model
-
         self.prefill_cfg = run.prefill
         self.decode_cfg = run.decode
         self.kv_mode = run.inference.kv_transfer
         self.serialize_decode = run.inference.serialize_decode_iterations
 
-        #different views of the same model with different parallelism configs for prefill and decode pools, same model_cfg shared by identity
+        #different views of the same model with different parallelism configs
         self.prefill_model = model.with_parallelism(run.prefill)
         self.decode_model = model.with_parallelism(run.decode)
 
-        #Model metadata
         model_cfg = run.model
         self.num_layers = model_cfg.num_layers
         self.hidden_size = model_cfg.hidden_size

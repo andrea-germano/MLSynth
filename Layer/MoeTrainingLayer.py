@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""NOT FUNCTIONAL -- the MoE training path, kept as upstream wrote it"""
+
 from Layer.Layer import Layer
 from Utils.nodes import allreduce, alltoall, compute
 from chakra.schema.protobuf.et_def_pb2 import (

@@ -16,13 +16,13 @@
 from collections import defaultdict
 from Orchestrator.Orchestrator import Orchestrator
 from Utils.config import TrainRunConfig
+from Model.Model import BaseTrainingModel
 from Utils.nodes import add_dependencies, allreduce, receive, send
 from chakra.schema.protobuf.et_def_pb2 import (GlobalMetadata)
 
 
 class MegatronLM(Orchestrator):
-    """3D-parallel (DP x PP x TP) training orchestrator. `model` is a TrainingModel or a Wrapper around one"""
-    def __init__(self, model, run: TrainRunConfig):
+    def __init__(self, model: BaseTrainingModel, run: TrainRunConfig):
         self.model = model
         self.dp_size = run.parallelism.dp_size
         self.pp_size = run.parallelism.pp_size
